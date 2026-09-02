@@ -1,0 +1,8 @@
+active: local
+servers:
+  - id: local
+    name: Local sing-box
+    type: direct
+    api: auto   # auto | clash | grpc
+    address: 127.0.0.1:9090
+    secret: ""

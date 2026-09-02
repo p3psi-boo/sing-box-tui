@@ -1,0 +1,16 @@
+# Go
+.go/
+bin/
+*.exe
+*.test
+
+# Generated
+gen/
+
+# Nix
+result
+.direnv/
+
+# Editor
+.idea/
+.vscode/
