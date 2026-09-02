@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/p3psi-boo/sing-box-tui/gen/daemon"
 	"github.com/p3psi-boo/sing-box-tui/internal/client"
 	"github.com/p3psi-boo/sing-box-tui/internal/ui"
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 var logLevelCycle = []int32{2, 3, 4, 5, 6} // error → trace
@@ -43,7 +43,10 @@ func (m Model) viewLogs(height int) string {
 	}
 	entries := m.filteredLogs()
 	if len(entries) == 0 {
-		return "No log entries"
+		if len(m.snapshot.Logs) > 0 {
+			return ui.DimStyle.Render("No entries at this level")
+		}
+		return ui.DimStyle.Render("No log entries")
 	}
 
 	n := len(entries)
@@ -57,22 +60,37 @@ func (m Model) viewLogs(height int) string {
 		}
 	}
 	end := min(n, start+height)
+	newer := 0
+	if !m.logFollow && end < n && height > 1 {
+		end = min(n, start+height-1)
+		newer = n - end
+	}
 
 	var lines []string
 	for _, entry := range entries[start:end] {
-		label := strings.ToLower(ui.LogLevelLabel(int32(entry.Level)))
-		text := ui.Truncate(fmt.Sprintf("%-5s %s", label, entry.Message), m.width)
-		switch entry.Level {
-		case daemon.LogLevel_PANIC, daemon.LogLevel_FATAL, daemon.LogLevel_ERROR:
-			text = ui.ErrorStyle.Render(text)
-		case daemon.LogLevel_WARN:
-			text = ui.WarningStyle.Render(text)
-		case daemon.LogLevel_DEBUG, daemon.LogLevel_TRACE:
-			text = ui.DimStyle.Render(text)
-		}
-		lines = append(lines, text)
+		lines = append(lines, renderLogLine(entry, m.width))
+	}
+	if newer > 0 {
+		lines = append(lines, ui.DimStyle.Render(ui.Truncate(fmt.Sprintf("↓ %d newer", newer), m.width)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func renderLogLine(entry client.LogEntry, width int) string {
+	label := ui.PadRight(strings.ToLower(ui.LogLevelLabel(int32(entry.Level))), 5)
+	msg := entry.Message
+	switch entry.Level {
+	case daemon.LogLevel_PANIC, daemon.LogLevel_FATAL, daemon.LogLevel_ERROR:
+		label = ui.ErrorStyle.Render(label)
+	case daemon.LogLevel_WARN:
+		label = ui.WarningStyle.Render(label)
+	case daemon.LogLevel_DEBUG, daemon.LogLevel_TRACE:
+		label = ui.DimStyle.Render(label)
+		msg = ui.DimStyle.Render(msg)
+	default:
+		label = ui.DimStyle.Render(label)
+	}
+	return ui.Truncate(label+"  "+msg, width)
 }
 
 func (m *Model) updateLogsKey(msg tea.KeyMsg, action string) tea.Cmd {

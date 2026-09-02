@@ -155,6 +155,10 @@ func Sparkline(values []int64, width int) string {
 	return b.String()
 }
 
+func DisplayWidth(s string) int {
+	return ansi.StringWidth(s)
+}
+
 func Truncate(s string, width int) string {
 	if width <= 0 {
 		return ""
@@ -163,6 +167,34 @@ func Truncate(s string, width int) string {
 		return s
 	}
 	return ansi.Truncate(s, width, "…")
+}
+
+func PadRight(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	w := ansi.StringWidth(s)
+	if w == width {
+		return s
+	}
+	if w > width {
+		return Truncate(s, width)
+	}
+	return s + strings.Repeat(" ", width-w)
+}
+
+func PadLeft(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	w := ansi.StringWidth(s)
+	if w == width {
+		return s
+	}
+	if w > width {
+		return Truncate(s, width)
+	}
+	return strings.Repeat(" ", width-w) + s
 }
 
 func Divider(width int) string {
@@ -195,15 +227,35 @@ func FormatDelay(ms int32) string {
 	return fmt.Sprintf("%dms", ms)
 }
 
+func FormatDelayCol(ms int32) string {
+	return PadLeft(FormatDelay(ms), 6)
+}
+
+func FormatRateCol(bps int64) string {
+	if bps <= 0 {
+		return PadLeft("-", 6)
+	}
+	return PadLeft(FormatBitrateShort(bps), 6)
+}
+
+func FormatRateArrow(arrow string, bps int64) string {
+	if bps <= 0 {
+		return PadLeft("-", 7)
+	}
+	return PadLeft(arrow+FormatBitrateShort(bps), 7)
+}
+
 func ProxyTypeLabel(t string) string {
 	labels := map[string]string{
 		"direct": "Direct", "block": "Block", "dns": "DNS",
 		"socks": "SOCKS", "http": "HTTP", "shadowsocks": "Shadowsocks",
 		"vmess": "VMess", "trojan": "Trojan", "wireguard": "WireGuard",
 		"hysteria": "Hysteria", "vless": "VLESS", "tuic": "TUIC",
-		"hysteria2": "Hysteria2", "selector": "Selector", "urltest": "URLTest",
+		"hysteria2": "Hysteria2", "anytls": "AnyTLS", "tailscale": "Tailscale",
+		"selector": "Selector", "urltest": "URLTest",
+		"fallback": "Fallback", "loadbalance": "LoadBalance",
 	}
-	if label, ok := labels[t]; ok {
+	if label, ok := labels[strings.ToLower(t)]; ok {
 		return label
 	}
 	return t

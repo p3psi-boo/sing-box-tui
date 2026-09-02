@@ -7,12 +7,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/p3psi-boo/sing-box-tui/gen/daemon"
-	"github.com/p3psi-boo/sing-box-tui/internal/client"
-	"github.com/p3psi-boo/sing-box-tui/internal/ui"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/p3psi-boo/sing-box-tui/gen/daemon"
+	"github.com/p3psi-boo/sing-box-tui/internal/client"
+	"github.com/p3psi-boo/sing-box-tui/internal/ui"
 )
 
 func connectionDest(c *daemon.Connection) string {
@@ -137,7 +137,7 @@ func (m Model) viewConnections(height int) string {
 		return ui.WarningStyle.Render(msg)
 	}
 	if !m.snapshot.ConnectionsLoaded {
-		return "Waiting for connections"
+		return ui.DimStyle.Render("Waiting for connections")
 	}
 
 	rows := m.filteredConnections()
@@ -151,16 +151,17 @@ func (m Model) viewConnections(height int) string {
 
 	if len(rows) == 0 {
 		if m.connSearch.Value() != "" {
-			top = append(top, "No matches")
+			top = append(top, ui.DimStyle.Render("No matches"))
 		} else {
-			top = append(top, "No connections")
+			top = append(top, ui.DimStyle.Render("No connections"))
 		}
 		return strings.Join(top, "\n")
 	}
 
+	cols := connColsFor(rows, m.width)
 	start, end, _ := visibleWindow(len(rows), m.connCursor, m.connOffset, lay.listH)
 	for i := start; i < end; i++ {
-		top = append(top, m.renderConnRow(rows[i], i == m.connCursor))
+		top = append(top, m.renderConnRow(rows[i], i == m.connCursor, cols))
 	}
 	list := lipgloss.NewStyle().Width(m.width).Height(lay.headH + lay.listH).MaxHeight(lay.headH + lay.listH).Render(strings.Join(top, "\n"))
 	if len(lay.pane) == 0 {
@@ -169,38 +170,114 @@ func (m Model) viewConnections(height int) string {
 	return list + "\n" + ui.Divider(m.width) + "\n" + strings.Join(lay.pane, "\n")
 }
 
-func (m Model) renderConnRow(row *client.ConnectionRow, current bool) string {
-	c := row.Connection
-	prefix := "  "
-	if current {
-		prefix = "> "
-	}
-	left := prefix + connectionDest(c)
-	var rightParts []string
-	if row.ClosedAt > 0 {
-		rightParts = append(rightParts, "closed")
-	} else {
-		if row.DownlinkRate > 0 || row.UplinkRate > 0 {
-			rates := ""
-			if row.DownlinkRate > 0 {
-				rates += "↓" + ui.FormatBitrateShort(row.DownlinkRate)
-			}
-			if row.UplinkRate > 0 {
-				if rates != "" {
-					rates += " "
-				}
-				rates += "↑" + ui.FormatBitrateShort(row.UplinkRate)
-			}
-			rightParts = append(rightParts, rates)
+type connCols struct {
+	destW  int
+	outW   int
+	netW   int
+	stateW int
+}
+
+func connColsFor(rows []*client.ConnectionRow, width int) connCols {
+	var c connCols
+	for _, row := range rows {
+		if row == nil || row.Connection == nil {
+			continue
+		}
+		if w := ui.DisplayWidth(connectionDest(row.Connection)); w > c.destW {
+			c.destW = w
+		}
+		if w := ui.DisplayWidth(row.Connection.Outbound); w > c.outW {
+			c.outW = w
+		}
+		if w := ui.DisplayWidth(row.Connection.Network); w > c.netW {
+			c.netW = w
+		}
+		if row.ClosedAt > 0 && c.stateW < 6 {
+			c.stateW = 6
 		}
 	}
-	if c.Outbound != "" {
-		rightParts = append(rightParts, "→ "+c.Outbound)
+	if c.outW > 16 {
+		c.outW = 16
 	}
-	if c.Network != "" {
-		rightParts = append(rightParts, c.Network)
+	if c.netW > 4 {
+		c.netW = 4
 	}
-	line := ui.FitRow(left, strings.Join(rightParts, "  "), m.width)
+
+	remain := func() int {
+		fixed := 2 + 1 + 7 + 2 + 7
+		if c.outW > 0 {
+			fixed += 2
+		}
+		if c.netW > 0 {
+			fixed += 2
+		}
+		if c.stateW > 0 {
+			fixed += 2
+		}
+		r := width - fixed - c.outW - c.netW - c.stateW
+		if r < 0 {
+			return 0
+		}
+		return r
+	}
+	if remain() < 8 && c.stateW >= 6 {
+		c.stateW = 1
+	}
+	if r := remain(); r < 8 && c.outW > 0 {
+		c.outW -= min(c.outW, 8-r)
+	}
+	if r := remain(); r < 8 && c.netW > 0 {
+		c.netW -= min(c.netW, 8-r)
+	}
+	r := remain()
+	if c.destW > r {
+		c.destW = r
+	}
+	if c.destW < 1 {
+		c.destW = 1
+	}
+	return c
+}
+
+func (c connCols) ident(cursor, dest, out, net, state string) string {
+	s := cursor + ui.PadRight(dest, c.destW)
+	if c.outW > 0 {
+		s += "  " + ui.PadRight(out, c.outW)
+	}
+	if c.netW > 0 {
+		s += "  " + ui.PadRight(net, c.netW)
+	}
+	if c.stateW > 0 {
+		s += "  " + ui.PadRight(state, c.stateW)
+	}
+	return s
+}
+
+func rateArrow(arrow string, bps int64) string {
+	s := ui.FormatRateArrow(arrow, bps)
+	if bps <= 0 {
+		return ui.DimStyle.Render(s)
+	}
+	return s
+}
+
+func (m Model) renderConnRow(row *client.ConnectionRow, current bool, cols connCols) string {
+	c := row.Connection
+	net := c.Network
+	if net != "" {
+		net = ui.DimStyle.Render(net)
+	}
+	state := ""
+	if row.ClosedAt > 0 {
+		if cols.stateW >= 6 {
+			state = ui.DimStyle.Render("closed")
+		} else if cols.stateW > 0 {
+			state = ui.DimStyle.Render("×")
+		}
+	}
+	left := cols.ident(cursorPrefix(current), connectionDest(c), c.Outbound, net, state)
+	right := rateArrow("↓", row.DownlinkRate) + "  " + rateArrow("↑", row.UplinkRate)
+	line := ui.FitRow(left, right, m.width)
 	if row.ClosedAt > 0 {
 		line = ui.DimStyle.Render(line)
 	}
@@ -300,24 +377,21 @@ func (m Model) connDetailLines(row *client.ConnectionRow) []string {
 	if row.ClosedAt > 0 {
 		state = "closed"
 	}
-	kv := func(k, v string) string {
-		if v == "" {
-			return ""
-		}
-		return ui.FitRow(ui.DimStyle.Render(k), v, m.width)
-	}
 	var metaBits []string
 	if c.Network != "" {
 		metaBits = append(metaBits, c.Network)
 	}
 	if c.Outbound != "" {
-		metaBits = append(metaBits, "→ "+c.Outbound)
+		metaBits = append(metaBits, c.Outbound)
 	}
 	metaBits = append(metaBits, state)
 	lines := []string{connectionDest(c), ui.DimStyle.Render(strings.Join(metaBits, "  "))}
+
+	type kv struct{ k, v string }
+	var pairs []kv
 	add := func(k, v string) {
-		if line := kv(k, v); line != "" {
-			lines = append(lines, line)
+		if v != "" {
+			pairs = append(pairs, kv{k, v})
 		}
 	}
 	add("source", c.Source)
@@ -342,11 +416,18 @@ func (m Model) connDetailLines(row *client.ConnectionRow) []string {
 		}
 		add("process", proc)
 	}
-	up := ui.FormatBytes(uint64(c.UplinkTotal))
-	down := ui.FormatBytes(uint64(c.DownlinkTotal))
-	add("traffic", "↑ "+up+"  ↓ "+down)
+	add("traffic", "↑ "+ui.FormatBytes(uint64(c.UplinkTotal))+"  ↓ "+ui.FormatBytes(uint64(c.DownlinkTotal)))
 	if c.CreatedAt > 0 {
 		add("created", time.UnixMilli(c.CreatedAt).Format("15:04:05"))
+	}
+	keyW := 0
+	for _, p := range pairs {
+		if w := ui.DisplayWidth(p.k); w > keyW {
+			keyW = w
+		}
+	}
+	for _, p := range pairs {
+		lines = append(lines, ui.Truncate(ui.PadRight(ui.DimStyle.Render(p.k), keyW)+"  "+p.v, m.width))
 	}
 	return lines
 }

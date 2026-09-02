@@ -1,51 +1,5 @@
 package app
 
-func groupRowHeight(rows []GroupRow, i, viewStart int) int {
-	if i > viewStart && i < len(rows) && rows[i].IsHeader {
-		return 2
-	}
-	return 1
-}
-
-func visibleGroups(rows []GroupRow, cursor, offset, height int) (start, end, newOffset int) {
-	n := len(rows)
-	if n == 0 || height < 1 {
-		return 0, 0, 0
-	}
-	cursor = clamp(cursor, 0, n-1)
-	if offset < 0 {
-		offset = 0
-	}
-	if cursor < offset {
-		offset = cursor
-	}
-	fillEnd := func(off int) int {
-		used := 0
-		i := off
-		for i < n {
-			h := groupRowHeight(rows, i, off)
-			if used > 0 && used+h > height {
-				break
-			}
-			used += h
-			i++
-			if used >= height {
-				break
-			}
-		}
-		if i == off && off < n {
-			return off + 1
-		}
-		return i
-	}
-	end = fillEnd(offset)
-	for cursor >= end && offset < cursor {
-		offset++
-		end = fillEnd(offset)
-	}
-	return offset, end, offset
-}
-
 func visibleWindow(n, cursor, offset, height int) (start, end, newOffset int) {
 	if n <= 0 {
 		return 0, 0, 0

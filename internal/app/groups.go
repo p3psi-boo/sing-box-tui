@@ -3,10 +3,10 @@ package app
 import (
 	"strings"
 
-	"github.com/p3psi-boo/sing-box-tui/gen/daemon"
-	"github.com/p3psi-boo/sing-box-tui/internal/ui"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/p3psi-boo/sing-box-tui/gen/daemon"
+	"github.com/p3psi-boo/sing-box-tui/internal/ui"
 )
 
 type GroupRow struct {
@@ -90,75 +90,183 @@ func (m Model) viewGroups(height int) string {
 		return m.viewDisconnected("")
 	}
 	if !m.snapshot.GroupsLoaded {
-		return "Waiting for groups"
+		return ui.DimStyle.Render("Waiting for groups")
 	}
 	if len(m.snapshot.Groups) == 0 {
-		return "No proxy groups"
+		return ui.DimStyle.Render("No proxy groups")
 	}
 
 	rows := m.buildGroupRows()
 	flat := m.groupsFlatCursor()
-	start, end, _ := visibleGroups(rows, flat, m.groupsOffset, height)
+	start, end, _ := visibleWindow(len(rows), flat, m.groupsOffset, height)
+	cols := m.groupCols()
 
 	var lines []string
 	for i := start; i < end; i++ {
-		if i > start && rows[i].IsHeader {
-			lines = append(lines, ui.Divider(m.width))
-		}
 		row := rows[i]
 		group := m.snapshot.Groups[row.GroupIndex]
 		cur := i == flat
 		if row.IsHeader {
-			lines = append(lines, m.renderGroupHeader(group, cur))
+			lines = append(lines, m.renderGroupHeader(group, cur, cols))
 			continue
 		}
 		item := group.Items[row.ItemIndex]
-		lines = append(lines, m.renderGroupItem(group, item, cur))
+		lines = append(lines, m.renderGroupItem(group, item, cur, cols))
 	}
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) renderGroupHeader(group *daemon.Group, current bool) string {
-	prefix := "  "
+type groupCols struct {
+	nameW int
+	typeW int
+	selW  int
+}
+
+func (m Model) groupCols() groupCols {
+	var c groupCols
+	for _, g := range m.snapshot.Groups {
+		if g == nil {
+			continue
+		}
+		if w := ui.DisplayWidth(g.Tag); w > c.nameW {
+			c.nameW = w
+		}
+		if w := ui.DisplayWidth(ui.ProxyTypeLabel(g.Type)); w > c.typeW {
+			c.typeW = w
+		}
+		if s := m.groupSelected(g); s != "" {
+			if w := ui.DisplayWidth(s); w > c.selW {
+				c.selW = w
+			}
+		}
+		if !m.groupExpanded(g) {
+			continue
+		}
+		for _, it := range g.Items {
+			if it == nil {
+				continue
+			}
+			if w := ui.DisplayWidth(it.Tag); w > c.nameW {
+				c.nameW = w
+			}
+			if w := ui.DisplayWidth(ui.ProxyTypeLabel(it.Type)); w > c.typeW {
+				c.typeW = w
+			}
+		}
+	}
+	if c.selW < 1 {
+		c.selW = 1
+	}
+
+	const maxName, delayW = 24, 6
+	fixed := 2 + 2 + delayW + 1 // cursor, chevron, delay, FitRow gap
+	if c.typeW > 0 {
+		fixed += 2
+	}
+	if c.selW > 0 {
+		fixed += 2
+	}
+	remain := m.width - fixed - c.typeW - c.selW
+	if remain < 0 {
+		cut := -remain
+		n := min(c.selW, cut)
+		c.selW -= n
+		cut -= n
+		if cut > 0 {
+			n = min(c.typeW, cut)
+			c.typeW -= n
+		}
+		remain = m.width - fixed - c.typeW - c.selW
+		if remain < 0 {
+			remain = 0
+		}
+	}
+	if c.nameW > maxName {
+		c.nameW = maxName
+	}
+	if c.nameW > remain {
+		c.nameW = remain
+	}
+	if c.nameW < 1 {
+		c.nameW = 1
+	}
+	return c
+}
+
+func (c groupCols) ident(cursor, chevron, name, typ, middle string) string {
+	s := cursor + chevron + ui.PadRight(name, c.nameW)
+	if c.typeW > 0 {
+		s += "  " + ui.PadRight(typ, c.typeW)
+	}
+	if c.selW > 0 {
+		s += "  " + ui.PadRight(middle, c.selW)
+	}
+	return s
+}
+
+func cursorPrefix(current bool) string {
 	if current {
-		prefix = "> "
+		return "> "
+	}
+	return "  "
+}
+
+func groupChevron(itemCount int, expanded bool) string {
+	switch {
+	case itemCount == 0:
+		return "  "
+	case expanded:
+		return "▾ "
+	default:
+		return "▸ "
+	}
+}
+
+func (m Model) renderGroupHeader(group *daemon.Group, current bool, cols groupCols) string {
+	typ := ""
+	if group.Type != "" {
+		typ = ui.DimStyle.Render(ui.ProxyTypeLabel(group.Type))
 	}
 	selected := m.groupSelected(group)
-	left := prefix + group.Tag
-	if selected != "" {
-		left += "  → " + selected
+	mid := selected
+	if selected != "" && !group.Selectable {
+		mid = ui.DimStyle.Render(selected)
 	}
-	var rightParts []string
+	left := cols.ident(
+		cursorPrefix(current),
+		ui.DimStyle.Render(groupChevron(len(group.Items), m.groupExpanded(group))),
+		group.Tag,
+		typ,
+		mid,
+	)
+
+	var delay string
 	if m.testingTag == group.Tag {
-		rightParts = append(rightParts, "…")
-	} else if delay := selectedDelay(group, selected); delay > 0 {
-		rightParts = append(rightParts, ui.DelayStyle(delay).Render(ui.FormatDelay(delay)))
+		delay = ui.DimStyle.Render(ui.PadLeft("…", 6))
+	} else {
+		ms := selectedDelay(group, selected)
+		delay = ui.DelayStyle(ms).Render(ui.FormatDelayCol(ms))
 	}
-	right := strings.Join(rightParts, " ")
-	line := ui.FitRow(left, right, m.width)
+
+	line := ui.FitRow(left, delay, m.width)
 	if current {
 		return ui.SelectedStyle.Render(line)
 	}
 	return line
 }
 
-func (m Model) renderGroupItem(group *daemon.Group, item *daemon.GroupItem, current bool) string {
-	prefix := "    "
-	if current {
-		prefix = "  ▸ "
-	}
-	left := prefix + item.Tag
+func (m Model) renderGroupItem(group *daemon.Group, item *daemon.GroupItem, current bool, cols groupCols) string {
+	typ := ""
 	if item.Type != "" {
-		left += "  " + ui.DimStyle.Render(ui.ProxyTypeLabel(item.Type))
+		typ = ui.DimStyle.Render(ui.ProxyTypeLabel(item.Type))
 	}
-	var rightParts []string
-	if item.UrlTestDelay > 0 {
-		rightParts = append(rightParts, ui.DelayStyle(item.UrlTestDelay).Render(ui.FormatDelay(item.UrlTestDelay)))
-	}
+	mid := ""
 	if m.groupSelected(group) == item.Tag {
-		rightParts = append(rightParts, ui.GoodStyle.Render("✓"))
+		mid = ui.GoodStyle.Render("✓")
 	}
-	line := ui.FitRow(left, strings.Join(rightParts, "  "), m.width)
+	left := cols.ident(cursorPrefix(current), "  ", item.Tag, typ, mid)
+	delay := ui.DelayStyle(item.UrlTestDelay).Render(ui.FormatDelayCol(item.UrlTestDelay))
+	line := ui.FitRow(left, delay, m.width)
 	if current {
 		return ui.SelectedStyle.Render(line)
 	}
@@ -190,7 +298,7 @@ func (m *Model) updateGroupsKey(msg tea.KeyMsg, action string) tea.Cmd {
 
 	move := func(next int) {
 		m.syncGroupsCursorFromFlat(clamp(next, 0, len(rows)-1))
-		_, _, m.groupsOffset = visibleGroups(rows, m.groupsFlatCursor(), m.groupsOffset, h)
+		_, _, m.groupsOffset = visibleWindow(len(rows), m.groupsFlatCursor(), m.groupsOffset, h)
 	}
 
 	switch {

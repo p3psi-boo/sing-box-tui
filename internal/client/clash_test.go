@@ -35,13 +35,13 @@ func TestGroupsFromProxies(t *testing.T) {
 	if len(groups) != 2 {
 		t.Fatalf("groups = %d", len(groups))
 	}
-	if groups[0].Tag != "proxy" || !groups[0].Selectable || groups[0].Selected != "jp-1" {
+	if groups[0].Tag != "proxy" || groups[0].Type != "selector" || !groups[0].Selectable || groups[0].Selected != "jp-1" {
 		t.Fatalf("proxy group: %+v", groups[0])
 	}
 	if groups[0].Items[0].UrlTestDelay != 80 {
 		t.Fatalf("delay = %d", groups[0].Items[0].UrlTestDelay)
 	}
-	if groups[1].Tag != "GLOBAL" || groups[1].Selectable {
+	if groups[1].Tag != "GLOBAL" || groups[1].Type != "fallback" || groups[1].Selectable {
 		t.Fatalf("GLOBAL: %+v", groups[1])
 	}
 }

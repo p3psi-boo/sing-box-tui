@@ -22,6 +22,21 @@ func TestFormatDelay(t *testing.T) {
 	if got := ui.FormatDelay(120); got != "120ms" {
 		t.Fatalf("got %q", got)
 	}
+	if got := ui.FormatDelayCol(80); got != "  80ms" {
+		t.Fatalf("col %q", got)
+	}
+	if got := ui.FormatDelayCol(0); got != "     -" {
+		t.Fatalf("empty col %q", got)
+	}
+}
+
+func TestPadRight(t *testing.T) {
+	if got := ui.PadRight("sel", 8); got != "sel     " {
+		t.Fatalf("got %q", got)
+	}
+	if got := ui.PadLeft("80ms", 6); got != "  80ms" {
+		t.Fatalf("left %q", got)
+	}
 }
 
 func TestFormatBitrateShort(t *testing.T) {
@@ -31,12 +46,34 @@ func TestFormatBitrateShort(t *testing.T) {
 	if got := ui.FormatBitrateShort(800); got != "800b" {
 		t.Fatalf("got %q", got)
 	}
+	if got := ui.FormatRateArrow("↓", 1_200_000); got != " ↓1.2Mb" {
+		t.Fatalf("arrow %q", got)
+	}
+	if got := ui.FormatRateArrow("↑", 0); got != "      -" {
+		t.Fatalf("idle %q", got)
+	}
 }
 
 func TestSparkline(t *testing.T) {
 	got := ui.Sparkline([]int64{0, 1, 2, 4}, 4)
 	if len([]rune(got)) != 4 {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestProxyTypeLabel(t *testing.T) {
+	cases := map[string]string{
+		"selector":    "Selector",
+		"URLTest":     "URLTest",
+		"fallback":    "Fallback",
+		"LoadBalance": "LoadBalance",
+		"vmess":       "VMess",
+		"custom":      "custom",
+	}
+	for in, want := range cases {
+		if got := ui.ProxyTypeLabel(in); got != want {
+			t.Fatalf("%q: got %q want %q", in, got, want)
+		}
 	}
 }
 

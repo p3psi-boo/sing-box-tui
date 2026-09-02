@@ -4,13 +4,13 @@ import (
 	"context"
 	"time"
 
-	"github.com/p3psi-boo/sing-box-tui/internal/client"
-	"github.com/p3psi-boo/sing-box-tui/internal/config"
-	"github.com/p3psi-boo/sing-box-tui/internal/ui"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/p3psi-boo/sing-box-tui/internal/client"
+	"github.com/p3psi-boo/sing-box-tui/internal/config"
+	"github.com/p3psi-boo/sing-box-tui/internal/ui"
 )
 
 type Page int
@@ -395,7 +395,7 @@ func (m *Model) clampWindows() {
 	h := m.contentHeight()
 	if rows := m.buildGroupRows(); len(rows) > 0 {
 		flat := m.groupsFlatCursor()
-		_, _, m.groupsOffset = visibleGroups(rows, flat, m.groupsOffset, h)
+		_, _, m.groupsOffset = visibleWindow(len(rows), flat, m.groupsOffset, h)
 	} else {
 		m.groupsOffset = 0
 	}
