@@ -143,12 +143,17 @@ func waitSessionUpdate(mgr *client.Manager) tea.Cmd {
 			time.Sleep(200 * time.Millisecond)
 			return waitSessionUpdate(mgr)()
 		}
-		u, ok := <-s.Updates()
-		if !ok {
+		select {
+		case u, ok := <-s.Updates():
+			if !ok {
+				time.Sleep(200 * time.Millisecond)
+				return waitSessionUpdate(mgr)()
+			}
+			return sessionUpdateMsg(u)
+		case <-s.Closed():
 			time.Sleep(200 * time.Millisecond)
 			return waitSessionUpdate(mgr)()
 		}
-		return sessionUpdateMsg(u)
 	}
 }
 

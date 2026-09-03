@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -204,20 +205,19 @@ func connectionFromClash(c clashConn) *daemon.Connection {
 }
 
 func mergeClashConnections(prev map[string]*ConnectionRow, snap clashConnSnapshot, now int64) map[string]*ConnectionRow {
-	if prev == nil {
-		prev = make(map[string]*ConnectionRow)
-	}
+	next := dupConnMap(prev)
 	seen := make(map[string]bool, len(snap.Connections))
 	for _, c := range snap.Connections {
 		if c.ID == "" {
 			continue
 		}
 		seen[c.ID] = true
-		row, ok := prev[c.ID]
+		row, ok := next[c.ID]
 		if !ok {
-			prev[c.ID] = &ConnectionRow{Connection: connectionFromClash(c)}
+			next[c.ID] = &ConnectionRow{Connection: connectionFromClash(c)}
 			continue
 		}
+		row = cloneConnectionRow(row)
 		if row.Connection != nil {
 			row.UplinkRate = c.Upload - row.Connection.UplinkTotal
 			row.DownlinkRate = c.Download - row.Connection.DownlinkTotal
@@ -230,22 +230,27 @@ func mergeClashConnections(prev map[string]*ConnectionRow, snap clashConnSnapsho
 		}
 		row.Connection = connectionFromClash(c)
 		row.ClosedAt = 0
+		next[c.ID] = row
 	}
-	for id, row := range prev {
+	for id, row := range next {
 		if !seen[id] && row != nil && row.ClosedAt == 0 {
+			row = cloneConnectionRow(row)
 			row.ClosedAt = now
 			row.UplinkRate = 0
 			row.DownlinkRate = 0
+			next[id] = row
 		}
 	}
-	pruneClosedLocked(prev)
-	return prev
+	pruneClosedLocked(next)
+	return next
 }
 
 func (s *Session) connectClash(ctx context.Context) error {
+	s.mu.Lock()
 	s.baseURL = httpBaseURL(s.target, s.server.TLS)
 	s.http = newHTTPClient(0)
 	s.kind = apiClash
+	s.mu.Unlock()
 
 	var ver clashVersion
 	if err := s.clashDo(ctx, http.MethodGet, "/version", nil, &ver); err != nil {
@@ -261,7 +266,7 @@ func (s *Session) connectClash(ctx context.Context) error {
 	s.snapshot.Version = strings.TrimPrefix(ver.Version, "sing-box ")
 	s.snapshot.ServiceStatus = daemon.ServiceStatus_STARTED
 	s.snapshot.ClashMode = cfg.Mode
-	s.snapshot.ClashModeList = cfg.ModeList
+	s.snapshot.ClashModeList = slices.Clone(cfg.ModeList)
 	if len(s.snapshot.ClashModeList) == 0 && cfg.Mode != "" {
 		s.snapshot.ClashModeList = []string{"Rule", "Global", "Direct"}
 	}
@@ -272,10 +277,7 @@ func (s *Session) connectClash(ctx context.Context) error {
 	s.snapshot.Status = &daemon.Status{}
 	s.mu.Unlock()
 	s.publish()
-
-	streamCtx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-	go s.runClash(streamCtx)
+	s.spawn(s.runClash)
 	return nil
 }
 
@@ -299,7 +301,21 @@ func (s *Session) runClash(ctx context.Context) {
 	s.publish()
 }
 
+func (s *Session) clashClient() (*http.Client, string, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	secret := ""
+	if s.server != nil {
+		secret = s.server.Secret
+	}
+	return s.http, s.baseURL, secret
+}
+
 func (s *Session) clashDo(ctx context.Context, method, path string, body any, out any) error {
+	httpClient, baseURL, secret := s.clashClient()
+	if httpClient == nil {
+		return fmt.Errorf("not connected")
+	}
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -308,7 +324,7 @@ func (s *Session) clashDo(ctx context.Context, method, path string, body any, ou
 		}
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, s.baseURL+path, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, rdr)
 	if err != nil {
 		return err
 	}
@@ -316,10 +332,10 @@ func (s *Session) clashDo(ctx context.Context, method, path string, body any, ou
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if s.server.Secret != "" {
-		req.Header.Set("Authorization", "Bearer "+s.server.Secret)
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
 	}
-	resp, err := s.http.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -345,15 +361,19 @@ func (s *Session) clashDo(ctx context.Context, method, path string, body any, ou
 }
 
 func (s *Session) clashStream(ctx context.Context, path string, handle func([]byte) error) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+path, nil)
+	httpClient, baseURL, secret := s.clashClient()
+	if httpClient == nil {
+		return fmt.Errorf("not connected")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	if s.server.Secret != "" {
-		req.Header.Set("Authorization", "Bearer "+s.server.Secret)
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
 	}
-	resp, err := s.http.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -386,12 +406,11 @@ func (s *Session) clashStreamTraffic(ctx context.Context) error {
 			return err
 		}
 		s.mu.Lock()
-		if s.snapshot.Status == nil {
-			s.snapshot.Status = &daemon.Status{}
-		}
-		s.snapshot.Status.TrafficAvailable = true
-		s.snapshot.Status.Uplink = t.Up
-		s.snapshot.Status.Downlink = t.Down
+		s.snapshot.Status = patchStatus(s.snapshot.Status, func(st *daemon.Status) {
+			st.TrafficAvailable = true
+			st.Uplink = t.Up
+			st.Downlink = t.Down
+		})
 		s.snapshot.UplinkHist = appendHist(s.snapshot.UplinkHist, t.Up)
 		s.snapshot.DownlinkHist = appendHist(s.snapshot.DownlinkHist, t.Down)
 		s.mu.Unlock()
@@ -408,14 +427,11 @@ func (s *Session) clashStreamLogs(ctx context.Context) error {
 		}
 		s.mu.Lock()
 		s.logID++
-		s.snapshot.Logs = append(s.snapshot.Logs, LogEntry{
+		s.snapshot.Logs = appendLogEntries(s.snapshot.Logs, LogEntry{
 			ID:      s.logID,
 			Level:   clashLogLevel(line.Type),
 			Message: line.Payload,
 		})
-		if len(s.snapshot.Logs) > maxLogEntries {
-			s.snapshot.Logs = s.snapshot.Logs[len(s.snapshot.Logs)-maxLogEntries:]
-		}
 		s.mu.Unlock()
 		s.publish()
 		return nil
@@ -450,19 +466,18 @@ func (s *Session) clashRefreshConnections(ctx context.Context) error {
 	s.mu.Lock()
 	s.snapshot.Connections = mergeClashConnections(s.snapshot.Connections, snap, time.Now().UnixMilli())
 	s.snapshot.ConnectionsLoaded = true
-	if s.snapshot.Status == nil {
-		s.snapshot.Status = &daemon.Status{}
-	}
-	s.snapshot.Status.Memory = snap.Memory
-	s.snapshot.Status.UplinkTotal = snap.UploadTotal
-	s.snapshot.Status.DownlinkTotal = snap.DownloadTotal
 	n := 0
 	for _, row := range s.snapshot.Connections {
 		if row != nil && row.ClosedAt == 0 {
 			n++
 		}
 	}
-	s.snapshot.Status.ConnectionsOut = int32(n)
+	s.snapshot.Status = patchStatus(s.snapshot.Status, func(st *daemon.Status) {
+		st.Memory = snap.Memory
+		st.UplinkTotal = snap.UploadTotal
+		st.DownlinkTotal = snap.DownloadTotal
+		st.ConnectionsOut = int32(n)
+	})
 	s.mu.Unlock()
 	s.publish()
 	return nil
@@ -503,7 +518,7 @@ func (s *Session) clashRefreshProxies(ctx context.Context) error {
 		s.snapshot.ClashMode = cfg.Mode
 	}
 	if len(cfg.ModeList) > 0 {
-		s.snapshot.ClashModeList = cfg.ModeList
+		s.snapshot.ClashModeList = slices.Clone(cfg.ModeList)
 	}
 	s.mu.Unlock()
 	s.publish()

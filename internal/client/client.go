@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -68,36 +69,34 @@ type Snapshot struct {
 	DownlinkHist       []int64
 }
 
-func newSnapshot() Snapshot {
-	return Snapshot{
-		Connections: make(map[string]*ConnectionRow),
-	}
-}
-
 type Update struct {
 	Snapshot Snapshot
 }
 
 type Session struct {
-	server   *config.Server
-	target   string
-	tunnel   *tunnel.Tunnel
-	kind     string
-	http     *http.Client
-	baseURL  string
-	conn     *grpc.ClientConn
-	grpc     daemon.StartedServiceClient
-	cancel   context.CancelFunc
-	updates  chan Update
-	mu       sync.RWMutex
-	snapshot Snapshot
-	logID    int
+	server    *config.Server
+	target    string
+	tunnel    *tunnel.Tunnel
+	kind      string
+	http      *http.Client
+	baseURL   string
+	conn      *grpc.ClientConn
+	grpc      daemon.StartedServiceClient
+	cancel    context.CancelFunc
+	updates   chan Update
+	closed    chan struct{}
+	closeOnce sync.Once
+	streams   sync.WaitGroup
+	mu        sync.RWMutex
+	snapshot  Snapshot
+	logID     int
 }
 
 func NewSession(server *config.Server) *Session {
 	return &Session{
 		server:   server,
 		updates:  make(chan Update, 64),
+		closed:   make(chan struct{}),
 		snapshot: newSnapshot(),
 	}
 }
@@ -106,14 +105,36 @@ func (s *Session) Updates() <-chan Update {
 	return s.updates
 }
 
+func (s *Session) Closed() <-chan struct{} {
+	return s.closed
+}
+
 func (s *Session) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.snapshot
+	return cloneSnapshot(s.snapshot)
+}
+
+func (s *Session) api() (kind string, grpc daemon.StartedServiceClient) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.kind, s.grpc
+}
+
+func (s *Session) spawn(run func(context.Context)) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	s.cancel = cancel
+	s.mu.Unlock()
+	s.streams.Add(1)
+	go func() {
+		defer s.streams.Done()
+		run(ctx)
+	}()
 }
 
 func (s *Session) Connect(ctx context.Context) error {
-	if err := s.Close(); err != nil {
+	if err := s.stop(); err != nil {
 		return err
 	}
 	if err := s.server.Validate(); err != nil {
@@ -132,16 +153,21 @@ func (s *Session) Connect(ctx context.Context) error {
 		s.cleanupTransport()
 		return err
 	}
+	s.mu.Lock()
 	s.kind = kind
+	s.mu.Unlock()
 	if kind == apiClash {
 		if err := s.connectClash(ctx); err != nil {
 			s.cleanupTransport()
 			return err
 		}
-		if version != "" && s.snapshot.Version == "" {
-			s.mu.Lock()
+		s.mu.Lock()
+		needVer := version != "" && s.snapshot.Version == ""
+		if needVer {
 			s.snapshot.Version = version
-			s.mu.Unlock()
+		}
+		s.mu.Unlock()
+		if needVer {
 			s.publish()
 		}
 		return nil
@@ -161,17 +187,22 @@ func (s *Session) connectGRPC(ctx context.Context) error {
 		s.cleanupTransport()
 		return fmt.Errorf("grpc dial: %w", err)
 	}
+	client := daemon.NewStartedServiceClient(conn)
+	s.mu.Lock()
 	s.conn = conn
-	s.grpc = daemon.NewStartedServiceClient(conn)
+	s.grpc = client
 	s.kind = apiGRPC
+	s.mu.Unlock()
 
 	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	version, err := s.grpc.GetVersion(probeCtx, &emptypb.Empty{})
+	version, err := client.GetVersion(probeCtx, &emptypb.Empty{})
 	if err != nil {
 		_ = conn.Close()
+		s.mu.Lock()
 		s.conn = nil
 		s.grpc = nil
+		s.mu.Unlock()
 		s.cleanupTransport()
 		return classifyError(err)
 	}
@@ -184,10 +215,7 @@ func (s *Session) connectGRPC(ctx context.Context) error {
 	s.snapshot.APIVersion = version.ApiVersion
 	s.mu.Unlock()
 	s.publish()
-
-	streamCtx, streamCancel := context.WithCancel(context.Background())
-	s.cancel = streamCancel
-	go s.runStreams(streamCtx)
+	s.spawn(s.runStreams)
 	return nil
 }
 
@@ -206,25 +234,36 @@ func (s *Session) resolveTarget() (string, *tunnel.Tunnel, error) {
 	}
 }
 
-func (s *Session) Close() error {
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
+func (s *Session) stop() error {
+	s.mu.Lock()
+	cancel := s.cancel
+	s.cancel = nil
+	conn := s.conn
+	s.conn = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-	if s.conn != nil {
-		_ = s.conn.Close()
-		s.conn = nil
+	if conn != nil {
+		_ = conn.Close()
 	}
+	s.streams.Wait()
+	s.cleanupTransport()
+	s.mu.Lock()
 	s.grpc = nil
 	s.http = nil
 	s.baseURL = ""
 	s.kind = ""
-	s.cleanupTransport()
-	s.mu.Lock()
 	s.snapshot.Connected = false
 	s.mu.Unlock()
 	s.publish()
 	return nil
+}
+
+func (s *Session) Close() error {
+	err := s.stop()
+	s.closeOnce.Do(func() { close(s.closed) })
+	return err
 }
 
 func (s *Session) cleanupTransport() {
@@ -236,7 +275,7 @@ func (s *Session) cleanupTransport() {
 
 func (s *Session) Reconnect(ctx context.Context) error {
 	server := s.server
-	if err := s.Close(); err != nil {
+	if err := s.stop(); err != nil {
 		return err
 	}
 	s.server = server
@@ -276,7 +315,7 @@ func pruneClosedLocked(conns map[string]*ConnectionRow) {
 
 func (s *Session) publish() {
 	s.mu.RLock()
-	snap := s.snapshot
+	snap := cloneSnapshot(s.snapshot)
 	s.mu.RUnlock()
 	select {
 	case s.updates <- Update{Snapshot: snap}:
@@ -417,7 +456,11 @@ func (s *Session) runWithRetry(ctx context.Context, name string, fn func(context
 }
 
 func (s *Session) streamServiceStatus(ctx context.Context) error {
-	stream, err := s.grpc.SubscribeServiceStatus(ctx, &emptypb.Empty{})
+	_, grpc := s.api()
+	if grpc == nil {
+		return fmt.Errorf("not connected")
+	}
+	stream, err := grpc.SubscribeServiceStatus(ctx, &emptypb.Empty{})
 	if err != nil {
 		return err
 	}
@@ -435,7 +478,11 @@ func (s *Session) streamServiceStatus(ctx context.Context) error {
 }
 
 func (s *Session) streamStatus(ctx context.Context) error {
-	stream, err := s.grpc.SubscribeStatus(ctx, &daemon.SubscribeStatusRequest{Interval: statusInterval})
+	_, grpc := s.api()
+	if grpc == nil {
+		return fmt.Errorf("not connected")
+	}
+	stream, err := grpc.SubscribeStatus(ctx, &daemon.SubscribeStatusRequest{Interval: statusInterval})
 	if err != nil {
 		return err
 	}
@@ -445,7 +492,7 @@ func (s *Session) streamStatus(ctx context.Context) error {
 			return err
 		}
 		s.mu.Lock()
-		s.snapshot.Status = msg
+		s.snapshot.Status = cloneStatus(msg)
 		s.snapshot.UplinkHist = appendHist(s.snapshot.UplinkHist, msg.Uplink)
 		s.snapshot.DownlinkHist = appendHist(s.snapshot.DownlinkHist, msg.Downlink)
 		s.mu.Unlock()
@@ -454,7 +501,11 @@ func (s *Session) streamStatus(ctx context.Context) error {
 }
 
 func (s *Session) streamGroups(ctx context.Context) error {
-	stream, err := s.grpc.SubscribeGroups(ctx, &emptypb.Empty{})
+	_, grpc := s.api()
+	if grpc == nil {
+		return fmt.Errorf("not connected")
+	}
+	stream, err := grpc.SubscribeGroups(ctx, &emptypb.Empty{})
 	if err != nil {
 		return err
 	}
@@ -464,7 +515,7 @@ func (s *Session) streamGroups(ctx context.Context) error {
 			return err
 		}
 		s.mu.Lock()
-		s.snapshot.Groups = msg.Group
+		s.snapshot.Groups = cloneGroups(msg.Group)
 		s.snapshot.GroupsLoaded = true
 		s.mu.Unlock()
 		s.publish()
@@ -472,15 +523,19 @@ func (s *Session) streamGroups(ctx context.Context) error {
 }
 
 func (s *Session) streamClashMode(ctx context.Context) error {
-	status, err := s.grpc.GetClashModeStatus(ctx, &emptypb.Empty{})
+	_, grpc := s.api()
+	if grpc == nil {
+		return fmt.Errorf("not connected")
+	}
+	status, err := grpc.GetClashModeStatus(ctx, &emptypb.Empty{})
 	if err == nil {
 		s.mu.Lock()
-		s.snapshot.ClashModeList = status.ModeList
+		s.snapshot.ClashModeList = slices.Clone(status.ModeList)
 		s.snapshot.ClashMode = status.CurrentMode
 		s.mu.Unlock()
 		s.publish()
 	}
-	stream, err := s.grpc.SubscribeClashMode(ctx, &emptypb.Empty{})
+	stream, err := grpc.SubscribeClashMode(ctx, &emptypb.Empty{})
 	if err != nil {
 		return err
 	}
@@ -497,7 +552,11 @@ func (s *Session) streamClashMode(ctx context.Context) error {
 }
 
 func (s *Session) streamConnections(ctx context.Context) error {
-	stream, err := s.grpc.SubscribeConnections(ctx, &daemon.SubscribeConnectionsRequest{Interval: statusInterval})
+	_, grpc := s.api()
+	if grpc == nil {
+		return fmt.Errorf("not connected")
+	}
+	stream, err := grpc.SubscribeConnections(ctx, &daemon.SubscribeConnectionsRequest{Interval: statusInterval})
 	if err != nil {
 		if st, ok := status.FromError(err); ok && st.Code() == codes.Unimplemented {
 			s.mu.Lock()
@@ -516,30 +575,38 @@ func (s *Session) streamConnections(ctx context.Context) error {
 			return err
 		}
 		s.mu.Lock()
+		conns := s.snapshot.Connections
 		if msg.GetReset_() {
-			s.snapshot.Connections = make(map[string]*ConnectionRow)
+			conns = make(map[string]*ConnectionRow)
+		} else {
+			conns = dupConnMap(conns)
 		}
 		for _, event := range msg.Events {
 			switch event.Type {
 			case daemon.ConnectionEventType_CONNECTION_EVENT_NEW:
-				s.snapshot.Connections[event.Id] = &ConnectionRow{Connection: event.Connection}
+				conns[event.Id] = &ConnectionRow{Connection: cloneConnection(event.Connection)}
 			case daemon.ConnectionEventType_CONNECTION_EVENT_UPDATE:
-				if row, ok := s.snapshot.Connections[event.Id]; ok {
+				if row, ok := conns[event.Id]; ok {
+					row = cloneConnectionRow(row)
 					row.UplinkRate = event.UplinkDelta
 					row.DownlinkRate = event.DownlinkDelta
 					if event.Connection != nil {
-						row.Connection = event.Connection
+						row.Connection = cloneConnection(event.Connection)
 					}
+					conns[event.Id] = row
 				}
 			case daemon.ConnectionEventType_CONNECTION_EVENT_CLOSED:
-				if row, ok := s.snapshot.Connections[event.Id]; ok {
+				if row, ok := conns[event.Id]; ok {
+					row = cloneConnectionRow(row)
 					row.ClosedAt = event.ClosedAt
 					row.UplinkRate = 0
 					row.DownlinkRate = 0
+					conns[event.Id] = row
 				}
 			}
 		}
-		pruneClosedLocked(s.snapshot.Connections)
+		pruneClosedLocked(conns)
+		s.snapshot.Connections = conns
 		s.snapshot.ConnectionsLoaded = true
 		s.mu.Unlock()
 		s.publish()
@@ -547,7 +614,11 @@ func (s *Session) streamConnections(ctx context.Context) error {
 }
 
 func (s *Session) streamLogs(ctx context.Context) error {
-	level, err := s.grpc.GetDefaultLogLevel(ctx, &emptypb.Empty{})
+	_, grpc := s.api()
+	if grpc == nil {
+		return fmt.Errorf("not connected")
+	}
+	level, err := grpc.GetDefaultLogLevel(ctx, &emptypb.Empty{})
 	if err == nil {
 		s.mu.Lock()
 		s.snapshot.DefaultLogLevel = level.Level
@@ -555,7 +626,7 @@ func (s *Session) streamLogs(ctx context.Context) error {
 		s.mu.Unlock()
 		s.publish()
 	}
-	stream, err := s.grpc.SubscribeLog(ctx, &emptypb.Empty{})
+	stream, err := grpc.SubscribeLog(ctx, &emptypb.Empty{})
 	if err != nil {
 		return err
 	}
@@ -569,24 +640,27 @@ func (s *Session) streamLogs(ctx context.Context) error {
 			s.snapshot.Logs = nil
 			s.logID = 0
 		}
+		extra := make([]LogEntry, 0, len(msg.Messages))
 		for _, entry := range msg.Messages {
 			s.logID++
-			s.snapshot.Logs = append(s.snapshot.Logs, LogEntry{
+			extra = append(extra, LogEntry{
 				ID:      s.logID,
 				Level:   entry.Level,
 				Message: entry.Message,
 			})
 		}
-		if len(s.snapshot.Logs) > maxLogEntries {
-			s.snapshot.Logs = s.snapshot.Logs[len(s.snapshot.Logs)-maxLogEntries:]
-		}
+		s.snapshot.Logs = appendLogEntries(s.snapshot.Logs, extra...)
 		s.mu.Unlock()
 		s.publish()
 	}
 }
 
 func (s *Session) fetchStartedAt(ctx context.Context) error {
-	resp, err := s.grpc.GetStartedAt(ctx, &emptypb.Empty{})
+	_, grpc := s.api()
+	if grpc == nil {
+		return fmt.Errorf("not connected")
+	}
+	resp, err := grpc.GetStartedAt(ctx, &emptypb.Empty{})
 	if err != nil {
 		return err
 	}
@@ -601,15 +675,16 @@ func (s *Session) fetchStartedAt(ctx context.Context) error {
 // Actions
 
 func (s *Session) SelectOutbound(groupTag, outboundTag string) error {
-	if s.kind == apiClash {
+	kind, grpc := s.api()
+	if kind == apiClash {
 		return s.clashSelect(groupTag, outboundTag)
 	}
-	if s.grpc == nil {
+	if grpc == nil {
 		return fmt.Errorf("not connected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := s.grpc.SelectOutbound(ctx, &daemon.SelectOutboundRequest{
+	_, err := grpc.SelectOutbound(ctx, &daemon.SelectOutboundRequest{
 		GroupTag:    groupTag,
 		OutboundTag: outboundTag,
 	})
@@ -617,28 +692,30 @@ func (s *Session) SelectOutbound(groupTag, outboundTag string) error {
 }
 
 func (s *Session) URLTest(groupTag string) error {
-	if s.kind == apiClash {
+	kind, grpc := s.api()
+	if kind == apiClash {
 		return s.clashURLTest(groupTag)
 	}
-	if s.grpc == nil {
+	if grpc == nil {
 		return fmt.Errorf("not connected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err := s.grpc.URLTest(ctx, &daemon.URLTestRequest{OutboundTag: groupTag})
+	_, err := grpc.URLTest(ctx, &daemon.URLTestRequest{OutboundTag: groupTag})
 	return err
 }
 
 func (s *Session) SetGroupExpand(groupTag string, expand bool) error {
-	if s.kind == apiClash {
+	kind, grpc := s.api()
+	if kind == apiClash {
 		return nil
 	}
-	if s.grpc == nil {
+	if grpc == nil {
 		return fmt.Errorf("not connected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := s.grpc.SetGroupExpand(ctx, &daemon.SetGroupExpandRequest{
+	_, err := grpc.SetGroupExpand(ctx, &daemon.SetGroupExpandRequest{
 		GroupTag: groupTag,
 		IsExpand: expand,
 	})
@@ -646,46 +723,50 @@ func (s *Session) SetGroupExpand(groupTag string, expand bool) error {
 }
 
 func (s *Session) SetClashMode(mode string) error {
-	if s.kind == apiClash {
+	kind, grpc := s.api()
+	if kind == apiClash {
 		return s.clashSetMode(mode)
 	}
-	if s.grpc == nil {
+	if grpc == nil {
 		return fmt.Errorf("not connected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := s.grpc.SetClashMode(ctx, &daemon.ClashMode{Mode: mode})
+	_, err := grpc.SetClashMode(ctx, &daemon.ClashMode{Mode: mode})
 	return err
 }
 
 func (s *Session) CloseConnection(id string) error {
-	if s.kind == apiClash {
+	kind, grpc := s.api()
+	if kind == apiClash {
 		return s.clashCloseConnection(id)
 	}
-	if s.grpc == nil {
+	if grpc == nil {
 		return fmt.Errorf("not connected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := s.grpc.CloseConnection(ctx, &daemon.CloseConnectionRequest{Id: id})
+	_, err := grpc.CloseConnection(ctx, &daemon.CloseConnectionRequest{Id: id})
 	return err
 }
 
 func (s *Session) CloseAllConnections() error {
-	if s.kind == apiClash {
+	kind, grpc := s.api()
+	if kind == apiClash {
 		return s.clashCloseAll()
 	}
-	if s.grpc == nil {
+	if grpc == nil {
 		return fmt.Errorf("not connected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := s.grpc.CloseAllConnections(ctx, &emptypb.Empty{})
+	_, err := grpc.CloseAllConnections(ctx, &emptypb.Empty{})
 	return err
 }
 
 func (s *Session) ClearLogs() error {
-	if s.kind == apiClash {
+	kind, grpc := s.api()
+	if kind == apiClash {
 		s.mu.Lock()
 		s.snapshot.Logs = nil
 		s.logID = 0
@@ -693,16 +774,17 @@ func (s *Session) ClearLogs() error {
 		s.publish()
 		return nil
 	}
-	if s.grpc == nil {
+	if grpc == nil {
 		return fmt.Errorf("not connected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := s.grpc.ClearLogs(ctx, &emptypb.Empty{})
+	_, err := grpc.ClearLogs(ctx, &emptypb.Empty{})
 	return err
 }
 
 type Manager struct {
+	mu      sync.Mutex
 	session *Session
 }
 
@@ -711,29 +793,40 @@ func NewManager() *Manager {
 }
 
 func (m *Manager) Session() *Session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.session
 }
 
 func (m *Manager) Connect(ctx context.Context, server *config.Server) error {
-	if m.session != nil {
-		_ = m.session.Close()
+	sess := NewSession(server)
+	m.mu.Lock()
+	old := m.session
+	m.session = sess
+	m.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
 	}
-	m.session = NewSession(server)
-	return m.session.Connect(ctx)
+	return sess.Connect(ctx)
 }
 
 func (m *Manager) Close() error {
-	if m.session == nil {
+	m.mu.Lock()
+	sess := m.session
+	m.session = nil
+	m.mu.Unlock()
+	if sess == nil {
 		return nil
 	}
-	err := m.session.Close()
-	m.session = nil
-	return err
+	return sess.Close()
 }
 
 func (m *Manager) Reconnect(ctx context.Context) error {
-	if m.session == nil {
+	m.mu.Lock()
+	old := m.session
+	m.mu.Unlock()
+	if old == nil {
 		return fmt.Errorf("no active session")
 	}
-	return m.session.Reconnect(ctx)
+	return m.Connect(ctx, old.server)
 }

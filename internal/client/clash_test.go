@@ -87,6 +87,38 @@ func TestMergeClashConnections(t *testing.T) {
 	}
 }
 
+func TestMergeClashConnectionsDoesNotMutatePrev(t *testing.T) {
+	first := clashConnSnapshot{
+		Connections: []clashConn{{
+			ID:       "a",
+			Upload:   10,
+			Download: 100,
+			Metadata: struct {
+				Network         string `json:"network"`
+				Type            string `json:"type"`
+				SourceIP        string `json:"sourceIP"`
+				DestinationIP   string `json:"destinationIP"`
+				SourcePort      string `json:"sourcePort"`
+				DestinationPort string `json:"destinationPort"`
+				Host            string `json:"host"`
+				ProcessPath     string `json:"processPath"`
+			}{Host: "example.com"},
+		}},
+	}
+	prev := mergeClashConnections(nil, first, 1)
+	second := clashConnSnapshot{
+		Connections: []clashConn{{
+			ID:       "a",
+			Upload:   20,
+			Download: 400,
+		}},
+	}
+	_ = mergeClashConnections(prev, second, 2)
+	if prev["a"].UplinkRate != 0 || prev["a"].Connection.UplinkTotal != 10 {
+		t.Fatalf("prev mutated: %+v", prev["a"])
+	}
+}
+
 func TestClashLogLevel(t *testing.T) {
 	if clashLogLevel("warning") != daemon.LogLevel_WARN {
 		t.Fatal("warn")
