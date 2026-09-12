@@ -3,30 +3,36 @@ package app
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"unicode"
 
-	"github.com/p3psi-boo/sing-box-tui/internal/config"
-	"github.com/p3psi-boo/sing-box-tui/internal/ui"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/p3psi-boo/sing-box-tui/internal/client"
+	"github.com/p3psi-boo/sing-box-tui/internal/config"
+	"github.com/p3psi-boo/sing-box-tui/internal/ui"
 )
 
 var errNoServer = errors.New("no server configured")
 
 type serverForm struct {
-	typ    string
-	focus  int
-	inputs []textinput.Model
+	typ                   string
+	focus                 int
+	inputs                []textinput.Model
+	original              config.Server
+	editID                string
+	draft                 map[string]string
+	errorField, errorText string
 }
 
 func newInput(placeholder string, password bool) textinput.Model {
 	ti := textinput.New()
 	ti.Placeholder = placeholder
 	ti.Prompt = ""
-	ti.CharLimit = 256
+	ti.CharLimit = 0
 	if password {
 		ti.EchoMode = textinput.EchoPassword
 		ti.EchoCharacter = '•'
@@ -87,13 +93,19 @@ func aliasLabel(label string) string {
 
 func formLabels(typ string) []string {
 	if typ == "ssh" {
-		return []string{"type", "name", "host", "user", "port", "identity", "remote", "secret"}
+		return []string{"type", "name", "host", "user", "port", "identity", "remote", "secret", "api", "known_hosts"}
 	}
-	return []string{"type", "name", "address", "secret"}
+	return []string{"type", "name", "address", "secret", "api", "tls"}
 }
 
 func placeholderFor(typ, label string) string {
 	switch label {
+	case "api":
+		return "auto (auto / clash / grpc)"
+	case "tls":
+		return "false (true / false)"
+	case "known_hosts":
+		return "~/.ssh/known_hosts"
 	case "name":
 		return ""
 	case "address":
@@ -135,6 +147,7 @@ func (f *serverForm) fieldCount() int {
 func (m *Model) openForm() {
 	m.form = newServerForm()
 	m.mode = modeServerForm
+	m.resizeForm()
 }
 
 func (m Model) viewServerPicker(height int) string {
@@ -175,30 +188,87 @@ func (m Model) viewServerPicker(height int) string {
 
 func (m Model) viewServerForm(height int) string {
 	labels := m.form.labels()
-	labelWidth := 10
-	var lines []string
-	lines = append(lines, "Add server", "")
+	title := "Add server"
+	if m.form.editID != "" {
+		title = "Edit server"
+	}
+	h := max(1, height-1)
+	// A field and its validation message scroll together; focus is always visible.
+	var rows []string
+	focusRow := 0
 	for i, label := range labels {
-		prefix := "  "
 		if i == m.form.focus {
-			prefix = "> "
+			focusRow = len(rows)
 		}
-		head := fmt.Sprintf("%s%-*s", prefix, labelWidth, label)
-		var value string
-		if i == 0 {
-			value = m.form.typ
-		} else {
-			idx := i - 1
-			if idx >= 0 && idx < len(m.form.inputs) {
-				value = m.form.inputs[idx].View()
+		value := m.form.typ
+		if i > 0 {
+			value = m.form.inputs[i-1].View()
+		}
+		line := fmt.Sprintf("%s%-10s %s", cursorPrefix(i == m.form.focus), label, value)
+		rows = append(rows, ui.Truncate(line, m.width))
+		if label == m.form.errorField && m.form.errorText != "" {
+			rows = append(rows, ui.ErrorStyle.Render(ui.Truncate("  ! "+m.form.errorText, m.width)))
+		}
+	}
+	top := max(0, focusRow-h+1)
+	if m.form.errorField == labels[m.form.focus] && h > 1 {
+		top = max(0, focusRow-h+2)
+	}
+	end := min(len(rows), top+h)
+	title += fmt.Sprintf(" · field %d/%d", m.form.focus+1, len(labels))
+	return strings.Join(append([]string{ui.Truncate(title, m.width)}, rows[top:end]...), "\n")
+}
+
+func (m *Model) resizeForm() {
+	for i := range m.form.inputs {
+		m.form.inputs[i].Width = max(1, m.width-14)
+	}
+}
+
+func (m *Model) editServer(index int) {
+	if index < 0 || index >= len(m.cfg.Servers) {
+		return
+	}
+	s := m.cfg.Servers[index]
+	m.form = newServerForm()
+	m.form.original = s
+	m.form.editID = s.ID
+	m.form.typ = s.Type
+	if m.form.typ == "" {
+		m.form.typ = "direct"
+	}
+	m.form.rebuild(map[string]string{"name": s.Name, "address": s.Address, "secret": s.Secret, "host": s.SSH.Host, "user": s.SSH.User, "port": strconv.Itoa(s.SSH.Port), "identity": s.SSH.IdentityFile, "remote": s.RemoteAddress, "api": s.API, "tls": strconv.FormatBool(s.TLS), "known_hosts": s.SSH.KnownHostsFile})
+	if s.SSH.Port == 0 {
+		for i, label := range m.form.labels()[1:] {
+			if label == "port" {
+				m.form.inputs[i].SetValue("")
 			}
 		}
-		lines = append(lines, head+" "+value)
 	}
-	if len(lines) > height {
-		lines = lines[:height]
+	m.mode = modeServerForm
+	m.resizeForm()
+}
+
+func (f serverForm) values() map[string]string {
+	values := map[string]string{}
+	for i, label := range f.labels()[1:] {
+		values[label] = f.inputs[i].Value()
 	}
-	return strings.Join(lines, "\n")
+	return values
+}
+
+func (m *Model) formError(field, message string) error {
+	m.setError(message)
+	m.form.errorField = field
+	m.form.errorText = message
+	for i, label := range m.form.labels() {
+		if label == field {
+			m.form.focus = i
+			break
+		}
+	}
+	m.form.applyFocus()
+	return errors.New(message)
 }
 
 func (m Model) updateServers(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -207,14 +277,18 @@ func (m Model) updateServers(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 	case key.Matches(msg, m.keys.Help):
 		m.returnMode = modeServers
+		m.helpOffset = 0
 		m.mode = modeHelp
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
 	case key.Matches(msg, m.keys.Add):
 		m.openForm()
+	case msg.String() == "e":
+		m.editServer(m.settingsCursor)
 	case key.Matches(msg, m.keys.Delete):
 		if len(m.cfg.Servers) > 0 {
 			m.deleteIndex = m.settingsCursor
+			m.confirmOffset = 0
 			m.confirm = confirmDeleteServer
 			m.returnMode = modeServers
 			m.mode = modeConfirm
@@ -245,8 +319,16 @@ func (m *Model) activateServer(index int) tea.Cmd {
 		return nil
 	}
 	s := m.cfg.Servers[index]
-	m.cfg.Active = s.ID
-	_ = config.Save(m.cfgPath, m.cfg)
+	next := *m.cfg
+	next.Active = s.ID
+	if err := config.Save(m.cfgPath, &next); err != nil {
+		m.setError("Save failed: " + err.Error())
+		return nil
+	}
+	*m.cfg = next
+	m.connPaused = false
+	m.pausedConnections = nil
+	m.connID = ""
 	m.mode = modeNormal
 	m.setStatus("switching to " + s.DisplayName())
 	m.connectErr = ""
@@ -277,7 +359,9 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		cmd, err := m.submitForm()
 		if err != nil {
-			m.setStatus(err.Error())
+			if m.form.errorField == "" {
+				m.setError("Save failed: " + err.Error())
+			}
 			return m, nil
 		}
 		return m, cmd
@@ -292,6 +376,8 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	idx := m.form.focus - 1
 	if idx >= 0 && idx < len(m.form.inputs) {
+		m.form.errorField = ""
+		m.form.errorText = ""
 		var cmd tea.Cmd
 		m.form.inputs[idx], cmd = m.form.inputs[idx].Update(msg)
 		return m, cmd
@@ -300,32 +386,67 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) toggleFormType() {
+	if m.form.draft == nil {
+		m.form.draft = map[string]string{}
+	}
+	for k, v := range m.form.values() {
+		m.form.draft[k] = v
+	}
 	if m.form.typ == "ssh" {
 		m.form.typ = "direct"
 	} else {
 		m.form.typ = "ssh"
 	}
-	m.form.rebuild(nil)
+	m.form.rebuild(m.form.draft)
+	m.form.errorField = ""
+	m.form.errorText = ""
 	m.form.focus = 0
+	m.form.applyFocus()
+	m.resizeForm()
 }
 
 func (m *Model) submitForm() (tea.Cmd, error) {
-	values := map[string]string{}
-	labels := m.form.labels()
-	for i, label := range labels {
-		if i == 0 {
-			continue
-		}
-		idx := i - 1
-		if idx >= 0 && idx < len(m.form.inputs) {
-			values[label] = strings.TrimSpace(m.form.inputs[idx].Value())
+	m.form.errorField = ""
+	m.form.errorText = ""
+	values := m.form.values()
+	for key, value := range values {
+		if key != "secret" {
+			values[key] = strings.TrimSpace(value)
 		}
 	}
 	name := values["name"]
-	s := config.Server{
-		Type:   m.form.typ,
-		Name:   name,
-		Secret: values["secret"],
+	s := m.form.original
+	s.Type = m.form.typ
+	s.Name = name
+	s.Secret = values["secret"]
+	s.API = values["api"]
+	if s.API != "" && s.API != "auto" && s.API != "clash" && s.API != "grpc" {
+		return nil, m.formError("api", "Use auto, clash or grpc")
+	}
+	if m.form.typ == "direct" {
+		if values["address"] == "" {
+			return nil, m.formError("address", "Enter host:port, e.g. 127.0.0.1:9090")
+		}
+		_, port, err := net.SplitHostPort(values["address"])
+		n, e := strconv.Atoi(port)
+		if err != nil || e != nil || n < 1 || n > 65535 {
+			return nil, m.formError("address", "Use host:port with port 1–65535")
+		}
+		tls := values["tls"]
+		if tls != "" && tls != "true" && tls != "false" {
+			return nil, m.formError("tls", "Use true or false")
+		}
+		s.TLS = tls == "true"
+		if s.TLS && s.API == "grpc" {
+			return nil, m.formError("tls", "TLS is supported only with Clash API")
+		}
+	} else {
+		for _, field := range []string{"host", "user", "identity"} {
+			if values[field] == "" {
+				return nil, m.formError(field, "Enter "+field)
+			}
+		}
+		s.SSH.KnownHostsFile = values["known_hosts"]
 	}
 	switch m.form.typ {
 	case "ssh":
@@ -335,8 +456,8 @@ func (m *Model) submitForm() (tea.Cmd, error) {
 		s.SSH.Port = 22
 		if values["port"] != "" {
 			p, err := strconv.Atoi(values["port"])
-			if err != nil || p <= 0 {
-				return nil, fmt.Errorf("invalid port")
+			if err != nil || p <= 0 || p > 65535 {
+				return nil, m.formError("port", "Use a port from 1 to 65535")
 			}
 			s.SSH.Port = p
 		}
@@ -354,30 +475,52 @@ func (m *Model) submitForm() (tea.Cmd, error) {
 			s.Name = s.Address
 		}
 	}
-	used := map[string]bool{}
-	for _, existing := range m.cfg.Servers {
-		used[existing.ID] = true
+	next := *m.cfg
+	next.Servers = append([]config.Server(nil), m.cfg.Servers...)
+	index := len(next.Servers)
+	if m.form.editID != "" {
+		index = -1
+		for i, old := range next.Servers {
+			if old.ID == m.form.editID {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			return nil, errors.New("server no longer exists; reopen the server list")
+		}
+		s.ID = m.form.editID
+	} else {
+		used := map[string]bool{}
+		for _, old := range next.Servers {
+			used[old.ID] = true
+		}
+		s.ID = slugID(s.Name, used)
 	}
-	s.ID = slugID(s.Name, used)
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
-	if s.Type == "ssh" && s.SSH.IdentityFile == "" {
-		return nil, fmt.Errorf("identity file is required")
+	if index == len(next.Servers) {
+		next.Servers = append(next.Servers, s)
+	} else {
+		next.Servers[index] = s
 	}
-	m.cfg.Servers = append(m.cfg.Servers, s)
-	if m.cfg.Active == "" {
-		m.cfg.Active = s.ID
+	if next.Active == "" {
+		next.Active = s.ID
 	}
-	if err := config.Save(m.cfgPath, m.cfg); err != nil {
-		m.cfg.Servers = m.cfg.Servers[:len(m.cfg.Servers)-1]
+	if err := config.Save(m.cfgPath, &next); err != nil {
 		return nil, err
 	}
-	m.settingsCursor = len(m.cfg.Servers) - 1
+	*m.cfg = next
+	m.statusError = false
+	m.statusMsg = ""
+	m.settingsCursor = index
 	m.mode = modeServers
-	m.setStatus("added " + s.DisplayName())
-	if m.cfg.Active == s.ID && !m.connected() {
+	m.setStatus("saved " + s.DisplayName())
+	if m.cfg.Active == s.ID {
 		m.mode = modeNormal
+		m.connPaused = false
+		m.pausedConnections = nil
 		return m.connectCmd(), nil
 	}
 	return nil, nil
@@ -385,13 +528,15 @@ func (m *Model) submitForm() (tea.Cmd, error) {
 
 func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "y", "enter":
+	case "y":
 		cmd := m.performConfirm()
 		return m, cmd
 	case "n", "esc", "q":
 		m.mode = m.returnMode
 		m.confirm = confirmNone
 		return m, nil
+	default:
+		m.confirmOffset = scrollKey(msg.String(), m.confirmOffset, len(m.confirmLines()), max(1, m.contentHeight()-1))
 	}
 	return m, nil
 }
@@ -401,6 +546,13 @@ func (m *Model) performConfirm() tea.Cmd {
 	m.confirm = confirmNone
 	m.mode = m.returnMode
 	switch kind {
+	case confirmCloseOne:
+		sess, id := m.closeSession, m.closeID
+		if sess == nil || sess != m.session {
+			m.setError("Server changed; select the connection again")
+			return nil
+		}
+		return func() tea.Msg { return actionResultMsg{kind: "close", tag: id, err: sess.CloseConnection(id)} }
 	case confirmCloseAll:
 		m.mode = modeNormal
 		if m.session == nil {
@@ -428,22 +580,33 @@ func (m *Model) deleteServer(index int) tea.Cmd {
 		return nil
 	}
 	removed := m.cfg.Servers[index]
-	wasActive := removed.ID == m.cfg.Active
-	m.cfg.Servers = append(m.cfg.Servers[:index], m.cfg.Servers[index+1:]...)
+	next := *m.cfg
+	next.Servers = append([]config.Server(nil), m.cfg.Servers...)
+	next.Servers = append(next.Servers[:index], next.Servers[index+1:]...)
+	wasActive := removed.ID == next.Active
 	if wasActive {
-		if len(m.cfg.Servers) > 0 {
-			m.cfg.Active = m.cfg.Servers[0].ID
-		} else {
-			m.cfg.Active = ""
+		next.Active = ""
+		if len(next.Servers) > 0 {
+			next.Active = next.Servers[0].ID
 		}
 	}
-	if m.settingsCursor >= len(m.cfg.Servers) && m.settingsCursor > 0 {
-		m.settingsCursor--
+	if err := config.Save(m.cfgPath, &next); err != nil {
+		m.setError("Save failed: " + err.Error())
+		return nil
 	}
-	_ = config.Save(m.cfgPath, m.cfg)
+	*m.cfg = next
+	m.settingsCursor = clamp(m.settingsCursor, 0, len(next.Servers)-1)
 	m.setStatus("removed " + removed.DisplayName())
-	if wasActive && m.cfg.Active != "" {
-		return m.connectCmd()
+	if wasActive {
+		m.connPaused = false
+		m.pausedConnections = nil
+		if next.Active != "" {
+			return m.connectCmd()
+		}
+		m.snapshot = client.Snapshot{}
+		m.session = nil
+		mgr := m.manager
+		return func() tea.Msg { return actionResultMsg{kind: "disconnect", err: mgr.Close()} }
 	}
 	return nil
 }

@@ -266,7 +266,7 @@ func TestViewLogsLayout(t *testing.T) {
 		{Level: daemon.LogLevel_DEBUG, Message: "noise"},
 	}
 	got := ansi.Strip(m.viewLogs(10))
-	if !strings.HasPrefix(strings.Split(got, "\n")[0], "error  boom") {
+	if !strings.HasPrefix(strings.Split(got, "\n")[1], "error  boom") {
 		t.Fatalf("error line: %q", got)
 	}
 	if !strings.Contains(got, "info   started") {

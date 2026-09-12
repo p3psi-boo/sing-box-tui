@@ -82,6 +82,7 @@ const (
 	modeServers
 	modeServerForm
 	modeConfirm
+	modeDetail
 )
 
 func (m *Model) resolveKey(msg tea.KeyMsg) string {

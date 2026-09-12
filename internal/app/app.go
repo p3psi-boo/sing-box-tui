@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -37,6 +38,7 @@ type confirmKind int
 const (
 	confirmNone confirmKind = iota
 	confirmCloseAll
+	confirmCloseOne
 	confirmDeleteServer
 )
 
@@ -60,19 +62,28 @@ func (f connStateFilter) String() string {
 }
 
 type Model struct {
-	cfgPath    string
-	cfg        *config.Config
-	manager    *client.Manager
-	session    *client.Session
-	snapshot   client.Snapshot
-	page       Page
-	width      int
-	height     int
-	keys       keyMap
-	mode       inputMode
-	statusMsg  string
-	statusAt   time.Time
-	connectErr string
+	cfgPath      string
+	cfg          *config.Config
+	manager      *client.Manager
+	session      *client.Session
+	snapshot     client.Snapshot
+	page         Page
+	width        int
+	height       int
+	keys         keyMap
+	mode         inputMode
+	statusMsg    string
+	statusAt     time.Time
+	statusError  bool
+	helpOffset   int
+	detail       detailView
+	discovery    discoveryState
+	closeID      string
+	closeTarget  string
+	closeSession *client.Session
+	connectErr   string
+
+	confirmOffset int
 
 	pendingKey   string
 	pendingKeyAt time.Time
@@ -85,10 +96,13 @@ type Model struct {
 	testingTag       string
 	pendingMode      string
 
-	connCursor int
-	connOffset int
-	connSearch textinput.Model
-	connFilter connStateFilter
+	connID            string
+	connPaused        bool
+	pausedConnections map[string]*client.ConnectionRow
+	connCursor        int
+	connOffset        int
+	connSearch        textinput.Model
+	connFilter        connStateFilter
 
 	logTop         int
 	logFollow      bool
@@ -121,6 +135,7 @@ func NewModel(cfgPath string, cfg *config.Config) Model {
 		logUseDefault:    true,
 		logLevelFilter:   -1,
 		mode:             modeNormal,
+		discovery:        discoveryState{scanning: len(cfg.Servers) == 0},
 	}
 }
 
@@ -128,6 +143,8 @@ func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{tickCmd(), waitSessionUpdate(m.manager)}
 	if m.cfg.ActiveServer() != nil {
 		cmds = append(cmds, m.connectCmd())
+	} else if len(m.cfg.Servers) == 0 {
+		cmds = append(cmds, discoverCmd())
 	}
 	return tea.Batch(cmds...)
 }
@@ -158,30 +175,21 @@ func waitSessionUpdate(mgr *client.Manager) tea.Cmd {
 }
 
 func (m Model) connectCmd() tea.Cmd {
+	active := m.cfg.ActiveServer()
+	if active == nil {
+		return func() tea.Msg { return connectResultMsg{err: errNoServer} }
+	}
+	server := *active
 	return func() tea.Msg {
-		server := m.cfg.ActiveServer()
-		if server == nil {
-			return connectResultMsg{err: errNoServer}
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return connectResultMsg{err: m.manager.Connect(ctx, server)}
+		return connectResultMsg{err: m.manager.Connect(ctx, &server)}
 	}
 }
 
 func (m Model) reconnectCmd() tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if m.manager.Session() == nil {
-			server := m.cfg.ActiveServer()
-			if server == nil {
-				return connectResultMsg{err: errNoServer}
-			}
-			return connectResultMsg{err: m.manager.Connect(ctx, server)}
-		}
-		return connectResultMsg{err: m.manager.Reconnect(ctx)}
-	}
+	// Re-read the edited configuration, rather than the old session's server copy.
+	return m.connectCmd()
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -190,11 +198,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.connSearch.Width = max(8, msg.Width-2)
+		m.resizeForm()
 		m.clampWindows()
 		return m, nil
 
+	case discoveryResultMsg:
+		m.discovery.scanning = false
+		m.discovery.results = msg.results
+		m.discovery.err = msg.err
+		return m, nil
 	case sessionUpdateMsg:
+		m.rememberConnection()
 		m.snapshot = client.Snapshot(msg.Snapshot)
+		m.restoreConnection()
 		m.session = m.manager.Session()
 		m.reconcilePending()
 		if m.snapshot.Connected {
@@ -227,7 +243,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.expirePendingKey()
-		if m.statusMsg != "" && time.Since(m.statusAt) > statusTTL {
+		if !m.statusError && m.statusMsg != "" && time.Since(m.statusAt) > statusTTL {
 			m.statusMsg = ""
 		}
 		return m, tickCmd()
@@ -240,20 +256,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.expirePendingKey()
-
+	if msg.String() == "ctrl+c" {
+		return m, tea.Quit
+	}
+	if m.statusError && m.mode != modeDetail && (msg.String() == "f2" || (msg.String() == "!" && m.mode != modeServerForm && m.mode != modeSearch)) {
+		m.openDetail("Error", m.statusMsg)
+		return m, nil
+	}
+	if m.statusError && msg.String() == "esc" && m.mode == modeNormal {
+		m.statusMsg = ""
+		m.statusError = false
+		return m, nil
+	}
 	switch m.mode {
 	case modeSearch:
 		return m.updateSearch(msg)
 	case modeServerForm:
 		return m.updateForm(msg)
+	case modeDetail:
+		return m.updateDetail(msg)
 	case modeHelp:
 		if key.Matches(msg, m.keys.Help) || key.Matches(msg, m.keys.Back) {
-			next := m.returnMode
-			if next == modeHelp {
-				next = modeNormal
-			}
-			m.mode = next
+			m.mode = m.returnMode
 			m.returnMode = modeNormal
+		} else {
+			m.helpOffset = scrollKey(msg.String(), m.helpOffset, len(m.helpLines()), max(1, m.contentHeight()-1))
 		}
 		return m, nil
 	case modeConfirm:
@@ -283,7 +310,18 @@ func (m *Model) handleGlobalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		return tea.Quit, true
 	case key.Matches(msg, m.keys.Help):
 		m.returnMode = modeNormal
+		m.helpOffset = 0
 		m.mode = modeHelp
+		return nil, true
+	case msg.String() == "e" && !m.connected():
+		if server := m.cfg.ActiveServer(); server != nil {
+			for i, s := range m.cfg.Servers {
+				if s.ID == server.ID {
+					m.editServer(i)
+					break
+				}
+			}
+		}
 		return nil, true
 	case key.Matches(msg, m.keys.Reconnect):
 		m.setStatus("reconnecting")
@@ -328,42 +366,36 @@ func (m Model) handlePageKey(msg tea.KeyMsg, action string) (tea.Model, tea.Cmd)
 }
 
 func (m Model) View() string {
-	if m.width == 0 {
+	if m.width <= 0 || m.height <= 0 {
 		return ""
 	}
-	if len(m.cfg.Servers) == 0 && m.mode != modeServerForm && m.mode != modeHelp {
-		return m.viewSetup()
+	if m.width < 24 || m.height < 6 {
+		return ui.Truncate("Resize to at least 24×6", m.width)
 	}
-	if len(m.cfg.Servers) == 0 && (m.mode == modeServerForm || m.mode == modeHelp) {
-		h := max(1, m.height-1)
-		var body string
-		if m.mode == modeServerForm {
-			body = m.viewServerForm(h)
-		} else {
-			body = m.viewHelp(h)
-		}
-		return lipgloss.NewStyle().Width(m.width).Height(h).Render(body) + "\n" + m.renderStatusBar()
+	body := m.renderContent(m.contentHeight())
+	if len(m.cfg.Servers) == 0 && m.mode == modeNormal {
+		body = m.viewSetup()
 	}
-
-	h := m.contentHeight()
-	content := m.renderContent(h)
-	var b string
-	b += m.renderTabs() + "\n"
-	b += lipgloss.NewStyle().Width(m.width).Height(h).MaxHeight(h).Render(content)
-	b += "\n" + m.renderStatusBar()
-	return b
+	lines := []string{m.renderTabs(), lipgloss.NewStyle().Width(m.width).Height(m.contentHeight()).MaxHeight(m.contentHeight()).Render(body), m.renderStatusBar()}
+	if m.statusMsg != "" {
+		lines = append(lines, m.renderMessage())
+	}
+	lines = append(lines, m.renderFooter())
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) contentHeight() int {
-	h := m.height - 2
-	if h < 1 {
-		return 1
+	reserved := 3
+	if m.statusMsg != "" {
+		reserved++
 	}
-	return h
+	return max(1, m.height-reserved)
 }
 
 func (m Model) renderContent(h int) string {
 	switch m.mode {
+	case modeDetail:
+		return m.viewDetail(h)
 	case modeHelp:
 		return m.viewHelp(h)
 	case modeServers:
@@ -384,9 +416,14 @@ func (m Model) renderContent(h int) string {
 }
 
 func (m *Model) setStatus(s string) {
+	if m.statusError {
+		return
+	}
 	m.statusMsg = s
 	m.statusAt = time.Now()
 }
+
+func (m *Model) setError(s string) { m.statusMsg = s; m.statusError = true; m.statusAt = time.Now() }
 
 func (m *Model) connected() bool {
 	return m.snapshot.Connected
@@ -449,37 +486,47 @@ func (m *Model) reconcilePending() {
 
 func (m *Model) applyActionResult(msg actionResultMsg) {
 	switch msg.kind {
+	case "disconnect":
+		if msg.err != nil {
+			m.setError("Disconnect failed: " + msg.err.Error())
+		}
+	case "copy":
+		if msg.err != nil {
+			m.setError("Copy failed: " + msg.err.Error())
+		} else {
+			m.setStatus("Copy sent to terminal clipboard")
+		}
 	case "clash":
 		if msg.err != nil {
 			m.pendingMode = ""
-			m.setStatus(msg.err.Error())
+			m.setError(msg.err.Error())
 		}
 	case "select":
 		if msg.err != nil {
 			delete(m.pendingSelect, msg.tag)
-			m.setStatus(selectErrorHint(msg.err, m.usingClash()))
+			m.setError(selectErrorHint(msg.err, m.usingClash()))
 		}
 	case "urltest":
 		m.testingTag = ""
 		if msg.err != nil {
-			m.setStatus(msg.err.Error())
+			m.setError(msg.err.Error())
 		} else {
 			m.setStatus("tested " + msg.tag)
 		}
 	case "clearLogs":
 		if msg.err != nil {
-			m.setStatus(msg.err.Error())
+			m.setError(msg.err.Error())
 		} else if m.usingClash() {
 			m.setStatus("cleared locally — Clash API cannot clear server logs")
 		}
 	case "expand":
 		if msg.err != nil {
 			delete(m.expandOverride, msg.tag)
-			m.setStatus(msg.err.Error())
+			m.setError(msg.err.Error())
 		}
 	case "close", "closeAll":
 		if msg.err != nil {
-			m.setStatus(msg.err.Error())
+			m.setError(msg.err.Error())
 		}
 	}
 }
@@ -509,11 +556,24 @@ func (m *Model) cycleClash(delta int) tea.Cmd {
 	}
 }
 
-func (m *Model) updateSetup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) updateSetup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Add):
 		m.openForm()
+	case key.Matches(msg, m.keys.Reconnect):
+		if !m.discovery.scanning {
+			m.discovery = discoveryState{scanning: true}
+			return m, discoverCmd()
+		}
+	case m.isDown(msg):
+		m.discovery.cursor = clamp(m.discovery.cursor+1, 0, len(m.discovery.results)-1)
+	case m.isUp(msg):
+		m.discovery.cursor = clamp(m.discovery.cursor-1, 0, len(m.discovery.results)-1)
+	case key.Matches(msg, m.keys.Confirm):
+		m.useDiscovered()
 	case key.Matches(msg, m.keys.Help):
+		m.helpOffset = 0
+		m.returnMode = modeNormal
 		m.mode = modeHelp
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit

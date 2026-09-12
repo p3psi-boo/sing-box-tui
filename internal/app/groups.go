@@ -287,6 +287,16 @@ func selectedDelay(group *daemon.Group, selected string) int32 {
 }
 
 func (m *Model) updateGroupsKey(msg tea.KeyMsg, action string) tea.Cmd {
+	if action == "v" && len(m.snapshot.Groups) > 0 {
+		g := m.snapshot.Groups[clamp(m.groupsCursor, 0, len(m.snapshot.Groups)-1)]
+		lines := []string{g.Tag, "type: " + g.Type, "selected: " + m.groupSelected(g)}
+		for _, it := range g.Items {
+			lines = append(lines, it.Tag+"  "+it.Type+"  "+ui.FormatDelay(it.UrlTestDelay))
+		}
+		m.openDetail("Group", strings.Join(lines, "\n"))
+		return nil
+	}
+
 	if !m.connected() || len(m.snapshot.Groups) == 0 {
 		return nil
 	}

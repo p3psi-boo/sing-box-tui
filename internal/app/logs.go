@@ -41,6 +41,18 @@ func (m Model) viewLogs(height int) string {
 	if !m.connected() {
 		return m.viewDisconnected("")
 	}
+	follow := "follow"
+	if !m.logFollow {
+		follow = "paused"
+	}
+	head := fmt.Sprintf("%s+ · %s · f level · G follow", strings.ToLower(ui.LogLevelLabel(m.logThreshold())), follow)
+	return ui.Truncate(head, m.width) + "\n" + m.viewLogEntries(max(1, height-1))
+}
+
+func (m Model) viewLogEntries(height int) string {
+	if !m.connected() {
+		return m.viewDisconnected("")
+	}
 	entries := m.filteredLogs()
 	if len(entries) == 0 {
 		if len(m.snapshot.Logs) > 0 {
@@ -96,7 +108,7 @@ func renderLogLine(entry client.LogEntry, width int) string {
 func (m *Model) updateLogsKey(msg tea.KeyMsg, action string) tea.Cmd {
 	entries := m.filteredLogs()
 	n := len(entries)
-	h := m.contentHeight()
+	h := max(1, m.contentHeight()-1)
 	maxTop := max(0, n-h)
 
 	if m.logFollow {
@@ -104,6 +116,17 @@ func (m *Model) updateLogsKey(msg tea.KeyMsg, action string) tea.Cmd {
 	}
 
 	switch {
+	case key.Matches(msg, m.keys.Confirm):
+		var lines []string
+		for _, entry := range entries {
+			lines = append(lines, strings.ToLower(ui.LogLevelLabel(int32(entry.Level)))+"  "+entry.Message)
+		}
+		m.openDetail("Logs (snapshot)", strings.Join(lines, "\n"))
+		if m.logFollow {
+			m.detail.offset = max(0, len(m.detailLines())-max(1, m.contentHeight()-1))
+		} else {
+			m.detail.offset = len(strings.Split(wrapText(strings.Join(lines[:clamp(m.logTop, 0, len(lines))], "\n"), m.width), "\n")) - 1
+		}
 	case action == "gg" || key.Matches(msg, m.keys.Top):
 		m.logFollow = false
 		m.logTop = 0

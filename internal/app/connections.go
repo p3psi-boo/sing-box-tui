@@ -77,13 +77,20 @@ func filterConnections(conns map[string]*client.ConnectionRow, query string, fil
 		if ri != rj {
 			return ri > rj
 		}
-		return rows[i].Connection.CreatedAt > rows[j].Connection.CreatedAt
+		if rows[i].Connection.CreatedAt != rows[j].Connection.CreatedAt {
+			return rows[i].Connection.CreatedAt > rows[j].Connection.CreatedAt
+		}
+		return rows[i].Connection.Id < rows[j].Connection.Id
 	})
 	return rows
 }
 
 func (m Model) filteredConnections() []*client.ConnectionRow {
-	return filterConnections(m.snapshot.Connections, m.connSearch.Value(), m.connFilter)
+	conns := m.snapshot.Connections
+	if m.connPaused {
+		conns = m.pausedConnections
+	}
+	return filterConnections(conns, m.connSearch.Value(), m.connFilter)
 }
 
 type connLayout struct {
@@ -93,7 +100,7 @@ type connLayout struct {
 }
 
 func (m Model) connLayout(height int, rows []*client.ConnectionRow) connLayout {
-	lay := connLayout{}
+	lay := connLayout{headH: 1}
 	if m.mode == modeSearch || m.connSearch.Value() != "" {
 		lay.headH = 1
 	}
@@ -143,10 +150,17 @@ func (m Model) viewConnections(height int) string {
 	rows := m.filteredConnections()
 	lay := m.connLayout(height, rows)
 	var top []string
+	state := m.connFilter.String()
+	if m.connPaused {
+		state += " · paused"
+	}
+	if m.mode != modeSearch {
+		top = append(top, ui.DimStyle.Render(ui.Truncate(fmt.Sprintf("%d %s · f filter", len(rows), state), m.width)))
+	}
 	if m.mode == modeSearch {
 		top = append(top, m.connSearch.View())
 	} else if q := m.connSearch.Value(); q != "" {
-		top = append(top, ui.DimStyle.Render("/"+q))
+		top[0] = ui.Truncate(top[0]+" /"+q+" · Esc clear", m.width)
 	}
 
 	if len(rows) == 0 {
@@ -167,7 +181,10 @@ func (m Model) viewConnections(height int) string {
 	if len(lay.pane) == 0 {
 		return list
 	}
-	return list + "\n" + ui.Divider(m.width) + "\n" + strings.Join(lay.pane, "\n")
+	for i := range lay.pane {
+		lay.pane[i] = ui.Truncate(lay.pane[i], m.width)
+	}
+	return list + "\n" + ui.Truncate("─ Enter: full details "+ui.Divider(m.width), m.width) + "\n" + strings.Join(lay.pane, "\n")
 }
 
 type connCols struct {
@@ -307,6 +324,7 @@ func (m *Model) updateConnectionsKey(msg tea.KeyMsg, action string) tea.Cmd {
 			return
 		}
 		m.connCursor = clamp(next, 0, n-1)
+		m.connID = rows[m.connCursor].Connection.Id
 		lay := m.connLayout(m.contentHeight(), rows)
 		_, _, m.connOffset = visibleWindow(n, m.connCursor, m.connOffset, lay.listH)
 	}
@@ -331,16 +349,35 @@ func (m *Model) updateConnectionsKey(msg tea.KeyMsg, action string) tea.Cmd {
 	case key.Matches(msg, m.keys.Filter):
 		m.connFilter = (m.connFilter + 1) % 3
 		m.connCursor = 0
+		m.connID = ""
 		m.clampWindows()
+	case msg.String() == "p":
+		m.rememberConnection()
+		m.connPaused = !m.connPaused
+		if m.connPaused {
+			m.pausedConnections = m.snapshot.Connections
+		} else {
+			m.pausedConnections = nil
+		}
+		m.restoreConnection()
+		m.clampWindows()
+	case key.Matches(msg, m.keys.Confirm):
+		if n > 0 {
+			m.openDetail("Connection", strings.Join(m.connDetailLines(rows[clamp(m.connCursor, 0, n-1)]), "\n"))
+		}
 	case key.Matches(msg, m.keys.CloseOne):
-		if m.session != nil && n > 0 && m.connCursor < n {
-			id := rows[m.connCursor].Connection.Id
-			sess := m.session
-			return func() tea.Msg {
-				return actionResultMsg{kind: "close", err: sess.CloseConnection(id)}
-			}
+		if m.session != nil && n > 0 && rows[m.connCursor].ClosedAt == 0 {
+			row := rows[m.connCursor]
+			m.closeID = row.Connection.Id
+			m.closeTarget = connectionDest(row.Connection)
+			m.closeSession = m.session
+			m.confirmOffset = 0
+			m.confirm = confirmCloseOne
+			m.returnMode = modeNormal
+			m.mode = modeConfirm
 		}
 	case key.Matches(msg, m.keys.CloseAll):
+		m.confirmOffset = 0
 		m.confirm = confirmCloseAll
 		m.returnMode = modeNormal
 		m.mode = modeConfirm
@@ -427,7 +464,23 @@ func (m Model) connDetailLines(row *client.ConnectionRow) []string {
 		}
 	}
 	for _, p := range pairs {
-		lines = append(lines, ui.Truncate(ui.PadRight(ui.DimStyle.Render(p.k), keyW)+"  "+p.v, m.width))
+		lines = append(lines, ui.PadRight(ui.DimStyle.Render(p.k), keyW)+"  "+p.v)
 	}
 	return lines
+}
+
+func (m *Model) rememberConnection() {
+	rows := m.filteredConnections()
+	if m.connCursor >= 0 && m.connCursor < len(rows) {
+		m.connID = rows[m.connCursor].Connection.Id
+	}
+}
+func (m *Model) restoreConnection() {
+	for i, row := range m.filteredConnections() {
+		if row.Connection.Id == m.connID {
+			m.connCursor = i
+			return
+		}
+	}
+	m.connID = ""
 }
