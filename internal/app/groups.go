@@ -5,6 +5,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/p3psi-boo/sing-box-tui/gen/daemon"
 	"github.com/p3psi-boo/sing-box-tui/internal/ui"
 )
@@ -250,7 +251,7 @@ func (m Model) renderGroupHeader(group *daemon.Group, current bool, cols groupCo
 
 	line := ui.FitRow(left, delay, m.width)
 	if current {
-		return ui.SelectedStyle.Render(line)
+		return ui.SelectedStyle.Render(ansi.Strip(line))
 	}
 	return line
 }
@@ -268,7 +269,7 @@ func (m Model) renderGroupItem(group *daemon.Group, item *daemon.GroupItem, curr
 	delay := ui.DelayStyle(item.UrlTestDelay).Render(ui.FormatDelayCol(item.UrlTestDelay))
 	line := ui.FitRow(left, delay, m.width)
 	if current {
-		return ui.SelectedStyle.Render(line)
+		return ui.SelectedStyle.Render(ansi.Strip(line))
 	}
 	return line
 }

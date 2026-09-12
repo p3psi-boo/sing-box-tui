@@ -109,6 +109,24 @@ func TestViewGroupsLayout(t *testing.T) {
 	}
 }
 
+func TestCurrentGroupRowsApplySelectionAcrossDelay(t *testing.T) {
+	m := sampleGroupsModel()
+	cols := m.groupCols()
+	group := m.snapshot.Groups[0]
+
+	header := m.renderGroupHeader(group, false, cols)
+	wantHeader := ui.SelectedStyle.Render("> " + strings.TrimPrefix(ansi.Strip(header), "  "))
+	if got := m.renderGroupHeader(group, true, cols); got != wantHeader {
+		t.Fatalf("selected header style does not cover the full row\ngot:  %q\nwant: %q", got, wantHeader)
+	}
+
+	item := m.renderGroupItem(group, group.Items[0], false, cols)
+	wantItem := ui.SelectedStyle.Render("> " + strings.TrimPrefix(ansi.Strip(item), "  "))
+	if got := m.renderGroupItem(group, group.Items[0], true, cols); got != wantItem {
+		t.Fatalf("selected item style does not cover the full row\ngot:  %q\nwant: %q", got, wantItem)
+	}
+}
+
 func TestGroupRowsDoNotAutoExpand(t *testing.T) {
 	m := NewModel("", &config.Config{})
 	m.snapshot.Groups = []*daemon.Group{
