@@ -64,13 +64,21 @@ func sampleGroupsModel() Model {
 	return m
 }
 
+func displayCol(line, sub string) int {
+	i := strings.Index(line, sub)
+	if i < 0 {
+		return -1
+	}
+	return ui.DisplayWidth(line[:i])
+}
+
 func TestViewGroupsLayout(t *testing.T) {
 	m := sampleGroupsModel()
 	got := ansi.Strip(m.viewGroups(20))
 	if strings.Contains(got, "──") {
 		t.Fatalf("dividers still present:\n%s", got)
 	}
-	if !strings.HasPrefix(got, "> ▸ proxy") {
+	if !strings.HasPrefix(got, "> ▸  proxy") {
 		t.Fatalf("cursor/chevron header:\n%s", got)
 	}
 	lines := strings.Split(got, "\n")
@@ -101,8 +109,16 @@ func TestViewGroupsLayout(t *testing.T) {
 	if len(lines) != 5 || !strings.Contains(lines[0], "▾") {
 		t.Fatalf("expanded:\n%s", got)
 	}
-	if !strings.HasPrefix(lines[1], "    jp-1") {
-		t.Fatalf("item indent:\n%s", lines[1])
+	if !strings.HasPrefix(lines[1], "  ├─ jp-1") {
+		t.Fatalf("item connector:\n%s", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "  └─ ") {
+		t.Fatalf("last item connector:\n%s", lines[2])
+	}
+	headerNameCol := displayCol(lines[0], "proxy")
+	itemNameCol := displayCol(lines[1], "jp-1")
+	if headerNameCol < 0 || headerNameCol != itemNameCol {
+		t.Fatalf("name columns not aligned (%d %d):\n%s", headerNameCol, itemNameCol, got)
 	}
 	if !strings.Contains(lines[1], "VMess") || !strings.Contains(lines[1], "✓") {
 		t.Fatalf("item meta:\n%s", lines[1])
@@ -120,9 +136,9 @@ func TestCurrentGroupRowsApplySelectionAcrossDelay(t *testing.T) {
 		t.Fatalf("selected header style does not cover the full row\ngot:  %q\nwant: %q", got, wantHeader)
 	}
 
-	item := m.renderGroupItem(group, group.Items[0], false, cols)
+	item := m.renderGroupItem(group, group.Items[0], false, false, cols)
 	wantItem := ui.SelectedStyle.Render("> " + strings.TrimPrefix(ansi.Strip(item), "  "))
-	if got := m.renderGroupItem(group, group.Items[0], true, cols); got != wantItem {
+	if got := m.renderGroupItem(group, group.Items[0], false, true, cols); got != wantItem {
 		t.Fatalf("selected item style does not cover the full row\ngot:  %q\nwant: %q", got, wantItem)
 	}
 }

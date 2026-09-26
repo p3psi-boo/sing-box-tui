@@ -112,7 +112,7 @@ func (m Model) viewGroups(height int) string {
 			continue
 		}
 		item := group.Items[row.ItemIndex]
-		lines = append(lines, m.renderGroupItem(group, item, cur, cols))
+		lines = append(lines, m.renderGroupItem(group, item, row.ItemIndex == len(group.Items)-1, cur, cols))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -160,7 +160,7 @@ func (m Model) groupCols() groupCols {
 	}
 
 	const maxName, delayW = 24, 6
-	fixed := 2 + 2 + delayW + 1 // cursor, chevron, delay, FitRow gap
+	fixed := 2 + 3 + delayW + 1 // cursor, chevron/connector, delay, FitRow gap
 	if c.typeW > 0 {
 		fixed += 2
 	}
@@ -215,12 +215,19 @@ func cursorPrefix(current bool) string {
 func groupChevron(itemCount int, expanded bool) string {
 	switch {
 	case itemCount == 0:
-		return "  "
+		return "   "
 	case expanded:
-		return "▾ "
+		return "▾  "
 	default:
-		return "▸ "
+		return "▸  "
 	}
+}
+
+func groupItemConnector(last bool) string {
+	if last {
+		return "└─ "
+	}
+	return "├─ "
 }
 
 func (m Model) renderGroupHeader(group *daemon.Group, current bool, cols groupCols) string {
@@ -256,7 +263,7 @@ func (m Model) renderGroupHeader(group *daemon.Group, current bool, cols groupCo
 	return line
 }
 
-func (m Model) renderGroupItem(group *daemon.Group, item *daemon.GroupItem, current bool, cols groupCols) string {
+func (m Model) renderGroupItem(group *daemon.Group, item *daemon.GroupItem, last bool, current bool, cols groupCols) string {
 	typ := ""
 	if item.Type != "" {
 		typ = ui.DimStyle.Render(ui.ProxyTypeLabel(item.Type))
@@ -265,7 +272,7 @@ func (m Model) renderGroupItem(group *daemon.Group, item *daemon.GroupItem, curr
 	if m.groupSelected(group) == item.Tag {
 		mid = ui.GoodStyle.Render("✓")
 	}
-	left := cols.ident(cursorPrefix(current), "  ", item.Tag, typ, mid)
+	left := cols.ident(cursorPrefix(current), groupItemConnector(last), item.Tag, typ, mid)
 	delay := ui.DelayStyle(item.UrlTestDelay).Render(ui.FormatDelayCol(item.UrlTestDelay))
 	line := ui.FitRow(left, delay, m.width)
 	if current {
