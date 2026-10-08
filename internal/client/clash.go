@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +33,55 @@ type clashDelayHist struct {
 
 type clashProxiesResponse struct {
 	Proxies map[string]clashProxy `json:"proxies"`
+	Names   []string              `json:"-"`
+}
+
+// UnmarshalJSON preserves proxy object member order as received on the wire.
+// A plain map loses that order; retain it separately for group rendering.
+func (r *clashProxiesResponse) UnmarshalJSON(data []byte) error {
+	var envelope struct {
+		Proxies json.RawMessage `json:"proxies"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	var next clashProxiesResponse
+	if len(envelope.Proxies) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Proxies), []byte("null")) {
+		*r = next
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(envelope.Proxies))
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('{') {
+		return fmt.Errorf("proxies: expected JSON object")
+	}
+	next.Proxies = make(map[string]clashProxy)
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := token.(string)
+		if !ok {
+			return fmt.Errorf("proxies: expected proxy name")
+		}
+		var proxy clashProxy
+		if err := dec.Decode(&proxy); err != nil {
+			return err
+		}
+		if _, exists := next.Proxies[name]; !exists {
+			next.Names = append(next.Names, name)
+		}
+		next.Proxies[name] = proxy
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	*r = next
+	return nil
 }
 
 type clashConfigs struct {
@@ -78,22 +126,13 @@ type clashConn struct {
 	} `json:"metadata"`
 }
 
-func groupsFromProxies(proxies map[string]clashProxy) []*daemon.Group {
+func groupsFromProxies(resp clashProxiesResponse) []*daemon.Group {
+	proxies := resp.Proxies
 	if len(proxies) == 0 {
 		return nil
 	}
-	names := make([]string, 0, len(proxies))
-	for name := range proxies {
-		if name != "GLOBAL" {
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	if _, ok := proxies["GLOBAL"]; ok {
-		names = append(names, "GLOBAL")
-	}
 	groups := make([]*daemon.Group, 0)
-	for _, name := range names {
+	for _, name := range resp.Names {
 		p := proxies[name]
 		if len(p.All) == 0 {
 			continue
@@ -510,7 +549,7 @@ func (s *Session) clashRefreshProxies(ctx context.Context) error {
 	}
 	var cfg clashConfigs
 	_ = s.clashDo(cctx, http.MethodGet, "/configs", nil, &cfg)
-	groups := groupsFromProxies(resp.Proxies)
+	groups := groupsFromProxies(resp)
 	s.mu.Lock()
 	s.snapshot.Groups = groups
 	s.snapshot.GroupsLoaded = true

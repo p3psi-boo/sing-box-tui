@@ -31,7 +31,7 @@ func TestGroupsFromProxies(t *testing.T) {
 			All:  []string{"proxy", "jp-1"},
 		},
 	}
-	groups := groupsFromProxies(proxies)
+	groups := groupsFromProxies(clashProxiesResponse{Proxies: proxies, Names: []string{"jp-1", "us-1", "proxy", "GLOBAL"}})
 	if len(groups) != 2 {
 		t.Fatalf("groups = %d", len(groups))
 	}
@@ -43,6 +43,67 @@ func TestGroupsFromProxies(t *testing.T) {
 	}
 	if groups[1].Tag != "GLOBAL" || groups[1].Type != "fallback" || groups[1].Selectable {
 		t.Fatalf("GLOBAL: %+v", groups[1])
+	}
+}
+
+func TestGroupsPreserveAPIOrder(t *testing.T) {
+	// Use literal JSON: encoding a map would alphabetize its keys.
+	const body = `{"proxies":{
+		"z-group":{"type":"Selector","all":["z-node","a-node","missing","z-node"]},
+		"GLOBAL":{"type":"Selector","all":["z-group","a-group"]},
+		"a-node":{"type":"Trojan","history":[{"delay":42}]},
+		"a-group":{"type":"URLTest","all":["a-node","z-node"]},
+		"z-node":{"type":"VMess","history":[{"delay":80}]}
+	}}`
+	var resp clashProxiesResponse
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := json.Unmarshal([]byte(body), &resp); err != nil {
+			t.Fatal(err)
+		}
+		groups := groupsFromProxies(resp)
+		want := []string{"z-group", "GLOBAL", "a-group"}
+		if len(groups) != len(want) {
+			t.Fatalf("groups = %d, want %d", len(groups), len(want))
+		}
+		for i, tag := range want {
+			if groups[i].Tag != tag {
+				t.Fatalf("group %d = %q, want %q", i, groups[i].Tag, tag)
+			}
+		}
+		items := groups[0].Items
+		wantItems := []string{"z-node", "a-node", "missing", "z-node"}
+		if len(items) != len(wantItems) {
+			t.Fatalf("items = %d, want %d", len(items), len(wantItems))
+		}
+		for i, tag := range wantItems {
+			if items[i].Tag != tag {
+				t.Fatalf("item %d = %q, want %q", i, items[i].Tag, tag)
+			}
+		}
+		if items[0].UrlTestDelay != 80 || items[1].UrlTestDelay != 42 {
+			t.Fatal("member metadata lost")
+		}
+	}
+}
+
+func TestClashProxiesResponseEmptyAndInvalid(t *testing.T) {
+	for _, body := range []string{`{}`, `{"proxies":null}`, `{"proxies":{}}`} {
+		resp := clashProxiesResponse{
+			Names:   []string{"old"},
+			Proxies: map[string]clashProxy{"old": {All: []string{"node"}}},
+		}
+		if err := json.Unmarshal([]byte(body), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Names) != 0 || len(groupsFromProxies(resp)) != 0 {
+			t.Fatalf("stale groups after decoding %s", body)
+		}
+	}
+	for _, body := range []string{`{"proxies":[]}`, `{"proxies":{"group":1}}`, `{"proxies":`} {
+		var resp clashProxiesResponse
+		if err := json.Unmarshal([]byte(body), &resp); err == nil {
+			t.Fatalf("expected error for %s", body)
+		}
 	}
 }
 
