@@ -109,18 +109,18 @@ func TestViewGroupsLayout(t *testing.T) {
 	if len(lines) != 5 || !strings.Contains(lines[0], "▾") {
 		t.Fatalf("expanded:\n%s", got)
 	}
-	if !strings.HasPrefix(lines[1], "  ├─ jp-1") {
+	if !strings.HasPrefix(lines[1], "  ├─ ● jp-1") {
 		t.Fatalf("item connector:\n%s", lines[1])
 	}
 	if !strings.HasPrefix(lines[2], "  └─ ") {
 		t.Fatalf("last item connector:\n%s", lines[2])
 	}
 	headerNameCol := displayCol(lines[0], "proxy")
-	itemNameCol := displayCol(lines[1], "jp-1")
+	itemNameCol := displayCol(lines[1], "● jp-1")
 	if headerNameCol < 0 || headerNameCol != itemNameCol {
 		t.Fatalf("name columns not aligned (%d %d):\n%s", headerNameCol, itemNameCol, got)
 	}
-	if !strings.Contains(lines[1], "VMess") || !strings.Contains(lines[1], "✓") {
+	if !strings.Contains(lines[1], "VMess") || !strings.Contains(lines[1], "●") {
 		t.Fatalf("item meta:\n%s", lines[1])
 	}
 }

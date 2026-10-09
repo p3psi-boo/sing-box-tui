@@ -147,7 +147,7 @@ func (m Model) groupCols() groupCols {
 			if it == nil {
 				continue
 			}
-			if w := ui.DisplayWidth(it.Tag); w > c.nameW {
+			if w := ui.DisplayWidth(it.Tag) + 2; w > c.nameW {
 				c.nameW = w
 			}
 			if w := ui.DisplayWidth(ui.ProxyTypeLabel(it.Type)); w > c.typeW {
@@ -268,11 +268,13 @@ func (m Model) renderGroupItem(group *daemon.Group, item *daemon.GroupItem, last
 	if item.Type != "" {
 		typ = ui.DimStyle.Render(ui.ProxyTypeLabel(item.Type))
 	}
-	mid := ""
+	name := item.Tag
 	if m.groupSelected(group) == item.Tag {
-		mid = ui.GoodStyle.Render("✓")
+		name = ui.GoodStyle.Render("● " + item.Tag)
+	} else {
+		name = ui.DimStyle.Render("○ ") + item.Tag
 	}
-	left := cols.ident(cursorPrefix(current), groupItemConnector(last), item.Tag, typ, mid)
+	left := cols.ident(cursorPrefix(current), groupItemConnector(last), name, typ, "")
 	delay := ui.DelayStyle(item.UrlTestDelay).Render(ui.FormatDelayCol(item.UrlTestDelay))
 	line := ui.FitRow(left, delay, m.width)
 	if current {
